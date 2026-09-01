@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failed build should not also cost incremental-compile artefacts.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    # Batuta is Windows-only: it reads the NTFS MFT and talks to the SCM.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned deliberately. A floating `stable` means a new Rust release can
+      # fail a build of code that has not changed — clippy gains lints every
+      # cycle, and `-D warnings` turns each one into a broken pipeline. The
+      # `lints` job below watches the newest toolchain without blocking.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        # Every test is designed to run without elevation and without touching
+        # a real volume, so the hosted runner can execute the whole suite.
+        run: cargo test --workspace
+
+      - name: Build release
+        run: cargo build --release
+
+  # Informational only: tells us about lints in newer toolchains before we
+  # move the pin, without letting them break the build in the meantime.
+  lints-on-latest:
+    runs-on: windows-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install latest stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (warnings do not fail the build)
+        run: cargo clippy --workspace --all-targets

@@ -1,0 +1,146 @@
+name: Release
+
+# Publishes a ready-to-run batuta.exe so nobody has to clone and build.
+#
+# Every push to the default branch cuts a release on its own: the version is
+# worked out from the tags already published, the tag is created as part of
+# publishing, and the exe is attached. Nothing has to be tagged by hand.
+#
+# Pushing a `v*` tag yourself still works and wins, and the workflow can be run
+# manually with an explicit version when you want to set one.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. v0.2.0. Leave empty to bump the patch."
+        required: false
+
+permissions:
+  # Needed to create the tag and the release.
+  contents: write
+
+# A second push while a release is building would race for the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags are what the next version is derived from, so the shallow
+          # default clone is not enough.
+          fetch-depth: 0
+
+      # Pinned, so a published release is reproducible and cannot be broken
+      # by a toolchain update landing between releases.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Work out the version
+        id: version
+        shell: pwsh
+        run: |
+          $explicit = '${{ github.event.inputs.version }}'.Trim()
+
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            # Someone tagged deliberately; that is the version.
+            $v = $env:GITHUB_REF -replace '^refs/tags/', ''
+          } elseif ($explicit) {
+            $v = $explicit
+          } else {
+            # Highest published vMAJOR.MINOR.PATCH, with the patch bumped.
+            git fetch --tags --force --quiet
+            $latest = git tag --list 'v*' |
+              ForEach-Object {
+                if ($_ -match '^v(\d+)\.(\d+)\.(\d+)$') {
+                  [version]('{0}.{1}.{2}' -f $Matches[1], $Matches[2], $Matches[3])
+                }
+              } |
+              Sort-Object -Descending | Select-Object -First 1
+
+            if ($latest) {
+              $v = 'v{0}.{1}.{2}' -f $latest.Major, $latest.Minor, ($latest.Build + 1)
+            } else {
+              # Nothing published yet: start from the version the crate declares.
+              $m = Select-String -Path Cargo.toml -Pattern '^\s*version\s*=\s*"([^"]+)"' |
+                   Select-Object -First 1
+              $v = 'v' + $m.Matches[0].Groups[1].Value
+            }
+          }
+
+          if (-not $v) { Write-Error "could not work out a version"; exit 1 }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "publishing $v"
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Stage artefacts
+        id: stage
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\batuta.exe dist\batuta.exe
+
+          # A checksum people can verify, since the binary is unsigned.
+          $hash = (Get-FileHash dist\batuta.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  batuta.exe" | Out-File -Encoding ascii dist\batuta.exe.sha256
+
+          $size = [math]::Round((Get-Item dist\batuta.exe).Length / 1MB, 2)
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "size=$size"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "batuta.exe $size MB, sha256 $hash"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Creates the tag on this commit when it does not exist yet, which is
+          # what makes the push-to-main path self-tagging.
+          tag_name: ${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: Batuta ${{ steps.version.outputs.version }}
+          make_latest: true
+          files: |
+            dist/batuta.exe
+            dist/batuta.exe.sha256
+          body: |
+            Instant file search for Windows. Download `batuta.exe` and run it —
+            it will walk you through setup.
+
+            **Getting started**
+
+            1. Download `batuta.exe` below.
+            2. Double-click it. It asks for Administrator (reading the NTFS
+               master file table needs it) and then walks through setup.
+            3. Search from anywhere with `batuta ui`, or the shortcut you chose.
+
+            **Windows will warn you.** The binary is not code-signed, so
+            SmartScreen shows "Windows protected your PC". Choose *More info*
+            then *Run anyway*, or verify the download first:
+
+            ```powershell
+            (Get-FileHash batuta.exe -Algorithm SHA256).Hash
+            ```
+
+            Expected: `${{ steps.stage.outputs.sha256 }}` (${{ steps.stage.outputs.size }} MB)
+
+            **Requirements:** Windows 10 or 11, NTFS volumes, Administrator for
+            the initial index and the background service.
+
+            **Removing it:** `batuta uninstall` takes out the service, scheduled
+            task, startup entry and PATH entry.

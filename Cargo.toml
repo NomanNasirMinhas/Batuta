@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/batuta-ntfs",
+    "crates/batuta-core",
+    "crates/batuta-ipc",
+    "crates/batuta-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Verified by building on it. The floor comes from the dependency tree
+# (ratatui pulls in crates requiring 1.88), not from this code.
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+rayon = "1.10"
+memchr = "2.7"
+rustc-hash = "2.0"
+parking_lot = "0.12"
+arc-swap = "1.7"
+memmap2 = "0.9"
+blake3 = { version = "1.5", features = ["mmap", "rayon"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+bytemuck = "1"
+ratatui = "0.29"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
