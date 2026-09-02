@@ -185,7 +185,10 @@ fn main() {
     // with it — but only some commands leave output worth reading. The UI in
     // particular is launched by the hotkey into a console of its own, and
     // should disappear when it closes rather than leaving a prompt behind.
-    if console::owns_console_alone() && (result.is_err() || leaves_output_to_read()) {
+    if !is_background_helper()
+        && console::owns_console_alone()
+        && (result.is_err() || leaves_output_to_read())
+    {
         console::wait_for_enter();
     }
     if result.is_err() {
@@ -197,6 +200,18 @@ fn main() {
 ///
 /// Setup and uninstall report what they changed; everything else either shows
 /// its own interface or is being read by another program.
+/// Started by the system rather than by a person, so there is nobody there to
+/// press Enter. A failed hotkey helper used to sit on a console window for the
+/// whole session instead of exiting, which is what the stray window at sign-in
+/// was.
+fn is_background_helper() -> bool {
+    background_helper(std::env::args().nth(1).as_deref())
+}
+
+fn background_helper(first_arg: Option<&str>) -> bool {
+    matches!(first_arg, Some("hotkey") | Some("service-run"))
+}
+
 fn leaves_output_to_read() -> bool {
     match std::env::args().nth(1).as_deref() {
         // A bare launch goes straight to Quick Setup.
@@ -230,7 +245,10 @@ fn run() -> Result<()> {
         Command::Setup { elevated } => do_setup(&cfg, *elevated),
         Command::Uninstall => do_uninstall(&cfg),
         Command::ServiceRun => service::run(),
-        Command::Hotkey { combo } => hotkey::run(combo, &cfg.exe_path()).map_err(Into::into),
+        Command::Hotkey { combo } => {
+            hotkey::run(combo, &cfg.exe_path(), &cfg.data_dir.join("hotkey.log"))
+                .map_err(Into::into)
+        }
 
         Command::Config { init } => {
             if *init {
@@ -922,4 +940,34 @@ fn do_scan(cfg: &Config, verbose: bool) -> Result<()> {
     let built = scan::scan_volumes(cfg, verbose)?;
     report_scan(cfg, &built);
     Ok(())
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn helpers_started_by_the_system_never_wait_for_a_keypress() {
+        // These are launched at sign-in or by the SCM, where holding a console
+        // open for an Enter nobody will press leaves a window on the desktop
+        // for the whole session.
+        assert!(background_helper(Some("hotkey")));
+        assert!(background_helper(Some("service-run")));
+    }
+
+    #[test]
+    fn commands_a_person_ran_still_hold_their_window_open() {
+        for arg in [
+            None,
+            Some("setup"),
+            Some("uninstall"),
+            Some("search"),
+            Some("ui"),
+        ] {
+            assert!(
+                !background_helper(arg),
+                "{arg:?} is not a background helper"
+            );
+        }
+    }
 }

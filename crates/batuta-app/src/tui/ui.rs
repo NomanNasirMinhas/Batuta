@@ -13,35 +13,40 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table};
 
-use super::app::{App, DupeEntry, Mode, DUPES_MIN_SIZE};
+use super::app::{App, DupeEntry, Kind, Mode, Sort, DUPES_MIN_SIZE};
+use super::layout::{self, Panes};
+use super::theme::theme;
 use crate::fmt;
 use batuta_ipc::Row;
 
-const DIM: Color = Color::DarkGray;
-
-/// The bytes-per-second question is really "which of these are worth acting
-/// on", so sizes answer it with color as well as columns.
-const GB: u64 = 1024 * 1024 * 1024;
+/// Secondary text. A function rather than a constant because the value now
+/// depends on what the terminal can render; see `theme.rs`.
+fn dim() -> Color {
+    theme().dim()
+}
 
 /// Each mode carries its own accent: the frame's border, its title, the mode
 /// pill, and the selected row all tint to it, so the mode you are in is legible
 /// before you read anything.
 fn mode_accent(mode: Mode) -> Color {
-    match mode {
-        Mode::Search => Color::Cyan,
-        Mode::Bloat => Color::LightMagenta,
-        Mode::Dupes => Color::Yellow,
-    }
+    theme().accent(mode)
 }
 
-/// Warm colors for sizes worth acting on: red from 1 GiB, yellow from 100 MiB.
+/// Warm colors for sizes worth acting on.
 fn size_color(size: u64) -> Option<Color> {
-    if size >= GB {
-        Some(Color::LightRed)
-    } else if size >= GB / 10 {
-        Some(Color::LightYellow)
-    } else {
-        None
+    theme().heat(size)
+}
+
+/// A framed panel in the current theme, so border style is decided in one
+/// place rather than at every call site.
+fn panel(border: Color) -> Block<'static> {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(theme().border_type())
+        .border_style(Style::default().fg(border));
+    match theme().panel() {
+        Some(bg) => block.style(Style::default().bg(bg)),
+        None => block,
     }
 }
 
@@ -53,7 +58,7 @@ fn size_style(size: u64) -> Style {
 /// the screen. Nothing on a selected row competes with it.
 fn selected_style(i: usize, cursor: Option<usize>, accent: Color) -> Style {
     if cursor == Some(i) {
-        Style::default().bg(accent).fg(Color::Black)
+        Style::default().bg(accent).fg(theme().on_accent())
     } else {
         Style::default()
     }
@@ -61,22 +66,20 @@ fn selected_style(i: usize, cursor: Option<usize>, accent: Color) -> Style {
 
 /// Draw a frame; returns how many result rows are visible.
 pub fn draw(f: &mut Frame, app: &App) -> usize {
-    let chunks = Layout::vertical([
-        Constraint::Length(3), // query box
-        Constraint::Min(1),    // results
-        Constraint::Length(1), // status
-    ])
-    .split(f.area());
+    let panes = layout::compute(f.area(), app.rail);
 
-    draw_query(f, chunks[0], app);
-    let visible = draw_results(f, chunks[1], app);
-    draw_status(f, chunks[2], app);
+    if let Some(rail) = panes.rail {
+        draw_rail(f, rail, app);
+    }
+    draw_query(f, panes.query, app, &panes);
+    let visible = draw_results(f, panes.results, app);
+    draw_status(f, panes.status, app);
 
     // Overlays last, so they sit above the list rather than being drawn over.
     // `dupes_pending` starts true so the first visit to that view scans, so it
     // has to be paired with the mode or the panel appears over every screen.
     if app.mode == Mode::Dupes && app.dupes_pending {
-        draw_scanning(f, chunks[1]);
+        draw_scanning(f, panes.results);
     }
     if let Some(pending) = &app.confirm_delete {
         draw_delete_confirm(f, f.area(), pending);
@@ -116,7 +119,7 @@ fn draw_scanning(f: &mut Frame, area: Rect) {
         .alignment(Alignment::Center),
         Line::from(Span::styled(
             "reading file contents, this takes a few seconds",
-            Style::default().fg(DIM),
+            Style::default().fg(dim()),
         ))
         .alignment(Alignment::Center),
     ];
@@ -145,7 +148,9 @@ fn draw_delete_confirm(f: &mut Frame, area: Rect, pending: &super::app::PendingD
         Line::from(""),
         Line::from(Span::styled(
             format!("Delete this {what}?"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme().danger())
+                .add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Center),
         Line::from(""),
@@ -160,7 +165,7 @@ fn draw_delete_confirm(f: &mut Frame, area: Rect, pending: &super::app::PendingD
                     fmt::bytes(pending.size),
                     fmt::count(pending.files as u64)
                 ),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme().warn()),
             ))
             .alignment(Alignment::Center),
         );
@@ -168,7 +173,7 @@ fn draw_delete_confirm(f: &mut Frame, area: Rect, pending: &super::app::PendingD
         text.push(
             Line::from(Span::styled(
                 fmt::bytes(pending.size),
-                Style::default().fg(DIM),
+                Style::default().fg(dim()),
             ))
             .alignment(Alignment::Center),
         );
@@ -178,7 +183,7 @@ fn draw_delete_confirm(f: &mut Frame, area: Rect, pending: &super::app::PendingD
     text.push(
         Line::from(Span::styled(
             "This does not go to the Recycle Bin.   Y delete    N cancel",
-            Style::default().fg(DIM),
+            Style::default().fg(dim()),
         ))
         .alignment(Alignment::Center),
     );
@@ -187,17 +192,87 @@ fn draw_delete_confirm(f: &mut Frame, area: Rect, pending: &super::app::PendingD
         Paragraph::new(text).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red))
+                .border_style(Style::default().fg(theme().danger()))
                 .title(Span::styled(
                     " confirm ",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme().danger())
+                        .add_modifier(Modifier::BOLD),
                 )),
         ),
         box_area,
     );
 }
 
-fn draw_query(f: &mut Frame, area: Rect, app: &App) {
+/// The rail: mode, filter and sort, all three visible at once.
+///
+/// These were previously reachable only through a chord and reported only as
+/// text in the status line, so the state you were in had to be remembered
+/// rather than seen. Nothing here is focusable: the query keeps the keyboard
+/// at all times, because typing is the primary loop and a focus ring that
+/// swallowed keystrokes would be a regression, not a feature.
+fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
+    let accent = mode_accent(app.mode);
+    let mut lines: Vec<Line> = Vec::new();
+
+    let section = |lines: &mut Vec<Line>, title: &str, items: Vec<(bool, &'static str)>| {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!(" {title}"),
+            Style::default().fg(dim()).add_modifier(Modifier::BOLD),
+        )));
+        for (active, label) in items {
+            // The marker carries the state as well as the colour does, so the
+            // rail still reads correctly with no colour at all.
+            let (marker, style) = if active {
+                (
+                    "\u{25b8} ",
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("  ", Style::default().fg(dim()))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(label, style),
+            ]));
+        }
+    };
+
+    section(
+        &mut lines,
+        "MODE",
+        vec![
+            (app.mode == Mode::Search, "SEARCH"),
+            (app.mode == Mode::Bloat, "BLOAT"),
+            (app.mode == Mode::Dupes, "DUPES"),
+        ],
+    );
+    section(
+        &mut lines,
+        "SHOW",
+        vec![
+            (app.kind == Kind::All, "ALL"),
+            (app.kind == Kind::DirsOnly, "DIRS"),
+            (app.kind == Kind::FilesOnly, "FILES"),
+        ],
+    );
+    section(
+        &mut lines,
+        "SORT",
+        vec![
+            (app.sort == Sort::Name, "NAME"),
+            (app.sort == Sort::Size, "SIZE"),
+            (app.sort == Sort::Modified, "MODIFIED"),
+        ],
+    );
+
+    f.render_widget(Paragraph::new(lines).block(panel(theme().border())), area);
+}
+
+fn draw_query(f: &mut Frame, area: Rect, app: &App, panes: &Panes) {
     let accent = mode_accent(app.mode);
 
     let title = match app.mode {
@@ -210,22 +285,29 @@ fn draw_query(f: &mut Frame, area: Rect, app: &App) {
         Mode::Search => Line::from(query_spans(app, accent)),
         Mode::Bloat => Line::from(vec![Span::styled(
             "ranked by rolled-up size — the bar shows each directory's share of the largest",
-            Style::default().fg(DIM),
+            Style::default().fg(dim()),
         )]),
         Mode::Dupes => Line::from(vec![Span::styled(
             "each file with the paths holding identical copies — F5 rescan, Shift+Tab modes",
-            Style::default().fg(DIM),
+            Style::default().fg(dim()),
         )]),
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent))
-        .title_top(Span::styled(
-            title,
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ))
-        .title_top(mode_pills(app.mode).alignment(Alignment::Right));
+    // A short terminal cannot afford two rows of frame around one row of
+    // text, and the title only labels something already obvious.
+    if panes.compact {
+        f.render_widget(Paragraph::new(prompt), area);
+        return;
+    }
+
+    let mut block = panel(accent).title_top(Span::styled(
+        title,
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    ));
+    // The rail names the mode in full; pills would be the same fact twice.
+    if panes.rail.is_none() {
+        block = block.title_top(mode_pills(app.mode).alignment(Alignment::Right));
+    }
 
     f.render_widget(Paragraph::new(prompt).block(block), area);
 }
@@ -236,7 +318,7 @@ fn query_spans(app: &App, accent: Color) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled("› ", Style::default().fg(accent))];
     match app.query.rsplit_once(['\\', '/']) {
         Some((dir, tail)) => {
-            spans.push(Span::styled(format!("{dir}\\"), Style::default().fg(DIM)));
+            spans.push(Span::styled(format!("{dir}\\"), Style::default().fg(dim())));
             spans.push(Span::styled(
                 tail.to_owned(),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -262,14 +344,14 @@ fn mode_pills(mode: Mode) -> Line<'static> {
     .enumerate()
     {
         if i > 0 {
-            spans.push(Span::styled(" │ ", Style::default().fg(DIM)));
+            spans.push(Span::styled(" │ ", Style::default().fg(dim())));
         }
         let style = if m == mode {
             Style::default()
                 .fg(mode_accent(mode))
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(DIM)
+            Style::default().fg(dim())
         };
         spans.push(Span::styled(format!(" {label} "), style));
     }
@@ -339,9 +421,7 @@ fn draw_results(f: &mut Frame, area: Rect, app: &App) -> usize {
         _ => app.rows.len(),
     };
     if loaded == 0 {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(DIM));
+        let block = panel(theme().border());
         let msg = match app.mode {
             Mode::Search if app.query.is_empty() => "type to search".to_string(),
             Mode::Dupes if !app.status.is_empty() => String::new(),
@@ -354,7 +434,7 @@ fn draw_results(f: &mut Frame, area: Rect, app: &App) -> usize {
             _ => "no matches".to_string(),
         };
         f.render_widget(
-            Paragraph::new(Span::styled(msg, Style::default().fg(DIM)))
+            Paragraph::new(Span::styled(msg, Style::default().fg(dim())))
                 .alignment(Alignment::Center)
                 .block(block),
             area,
@@ -362,9 +442,15 @@ fn draw_results(f: &mut Frame, area: Rect, app: &App) -> usize {
         return visible;
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(DIM));
+    // Position belongs next to the list, not twenty rows away in the status
+    // line where you have to go looking for it.
+    let block = panel(theme().border()).title_top(
+        Line::from(Span::styled(
+            format!(" {} of {} ", app.selected + 1, fmt::count(app.total)),
+            Style::default().fg(dim()),
+        ))
+        .alignment(Alignment::Right),
+    );
 
     let table = Table::new(rows, widths)
         .header(
@@ -398,7 +484,7 @@ fn search_row(
         Cell::from(fmt::timestamp(r.mtime)).style(if selected {
             base
         } else {
-            Style::default().fg(DIM)
+            Style::default().fg(dim())
         }),
         Cell::from(Text::from(Line::from(path_spans(
             &r.path, needle, selected, accent, r.is_dir,
@@ -418,7 +504,7 @@ fn path_spans(
     is_dir: bool,
 ) -> Vec<Span<'static>> {
     let base = if selected {
-        Style::default().bg(accent).fg(Color::Black)
+        Style::default().bg(accent).fg(theme().on_accent())
     } else if is_dir {
         Style::default().fg(accent)
     } else {
@@ -479,7 +565,7 @@ fn bloat_row(
         Cell::from(Text::from(fmt::bytes(r.own)).alignment(Alignment::Right)).style(if selected {
             base
         } else {
-            Style::default().fg(DIM)
+            Style::default().fg(dim())
         }),
         Cell::from(Text::from(Line::from(share_bar(
             r.size, max, selected, accent,
@@ -500,14 +586,14 @@ fn share_bar(size: u64, max: u64, selected: bool, accent: Color) -> Vec<Span<'st
     let filled = ((size as f64 / max as f64) * WIDTH as f64).round() as usize;
     let filled = filled.min(WIDTH);
     let bar = if selected {
-        Style::default().bg(accent).fg(Color::Black)
+        Style::default().bg(accent).fg(theme().on_accent())
     } else {
         Style::default().fg(size_color(size).unwrap_or(accent))
     };
     let rest = if selected {
-        Style::default().bg(accent).fg(Color::Black)
+        Style::default().bg(accent).fg(theme().on_accent())
     } else {
-        Style::default().fg(DIM)
+        Style::default().fg(dim())
     };
     vec![
         Span::styled("█".repeat(filled), bar),
@@ -531,7 +617,7 @@ fn dupe_row(
     let dim = if selected {
         base
     } else {
-        Style::default().fg(DIM)
+        Style::default().fg(dim())
     };
     match entry {
         DupeEntry::Group {
@@ -551,7 +637,7 @@ fn dupe_row(
                     if selected {
                         base
                     } else {
-                        Style::default().fg(Color::LightRed)
+                        Style::default().fg(theme().danger())
                     },
                 ),
                 Span::styled("──", dim),
@@ -569,14 +655,14 @@ fn dupe_row(
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let accent = mode_accent(app.mode);
     let bold = Style::default().add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(DIM);
+    let subtle = Style::default().fg(dim());
 
     let mut left = Vec::new();
 
     if !app.status.is_empty() {
         left.push(Span::styled(
             app.status.clone(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme().warn()),
         ));
     } else if app.mode == Mode::Dupes {
         let groups = app.dupe_group_count();
@@ -587,18 +673,18 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         )));
         left.push(Span::styled(
             format!("  ·  {} reclaimable", fmt::bytes(app.dupes_wasted)),
-            Style::default().fg(Color::LightRed),
+            Style::default().fg(theme().danger()),
         ));
         if app.total > 0 {
             left.push(Span::styled(
                 format!("  ·  {} of {}", app.selected + 1, fmt::count(app.total)),
-                dim,
+                subtle,
             ));
         }
         if app.elapsed_us > 0 {
             left.push(Span::styled(
                 format!("  ·  {:.2}s", app.elapsed_us as f64 / 1_000_000.0),
-                dim,
+                subtle,
             ));
         }
         left.push(Span::styled(
@@ -608,9 +694,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 "  ·  cached"
             },
             Style::default().fg(if app.live {
-                Color::Green
+                theme().ok()
             } else {
-                Color::Yellow
+                theme().warn()
             }),
         ));
     } else {
@@ -622,13 +708,13 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         if app.total > 0 {
             left.push(Span::styled(
                 format!("  ·  {} of {}", app.selected + 1, fmt::count(app.total)),
-                dim,
+                subtle,
             ));
         }
         if app.elapsed_us > 0 {
             left.push(Span::styled(
                 format!("  ·  {:.2}ms", app.elapsed_us as f64 / 1000.0),
-                dim,
+                subtle,
             ));
         }
         left.push(Span::styled(
@@ -638,15 +724,19 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 "  ·  cached"
             },
             Style::default().fg(if app.live {
-                Color::Green
+                theme().ok()
             } else {
-                Color::Yellow
+                theme().warn()
             }),
         ));
     }
 
     let state = format!("sort:{}  show:{}", app.sort.label(), app.kind.label());
-    let full = format!("{state}  │ Tab complete  Shift+Tab modes  Ctrl+S sort  Ctrl+T filter  Ctrl+D dupes  Enter open  Esc close");
+    let full = format!("{state}  │ Tab complete  Shift+Tab modes  Ctrl+S sort  Ctrl+T filter  Ctrl+B rail  Ctrl+D dupes  Enter open  Esc close");
+    // A middle tier, so the hints thin out rather than falling off a cliff
+    // from everything to nothing at one particular width.
+    let some =
+        format!("{state}  │ Shift+Tab modes  Ctrl+S sort  Ctrl+T filter  Enter open  Esc close");
     let short = format!("{state}  │ Esc close");
 
     // The status text is what the user needs; hints are a courtesy. Rather
@@ -657,7 +747,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     // multi-byte glyphs, and `len()` would over-reserve the right-hand column
     // and push the counters off screen.
     const MIN_STATUS: u16 = 40;
-    let keys = [full, short]
+    let keys = [full, some, short]
         .into_iter()
         .find(|k| area.width >= k.chars().count() as u16 + MIN_STATUS);
 
@@ -675,7 +765,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         chunks[0],
     );
     f.render_widget(
-        Paragraph::new(Span::styled(keys, Style::default().fg(DIM))).alignment(Alignment::Right),
+        Paragraph::new(Span::styled(keys, Style::default().fg(dim()))).alignment(Alignment::Right),
         chunks[1],
     );
 }
@@ -727,10 +817,88 @@ mod tests {
 
         for height in [10u16, 24, 50] {
             let (_, visible) = render(&app, 100, height);
-            // 3 rows for the query box, 1 for status, 2 borders, 1 header.
-            let expected = height.saturating_sub(3 + 1 + 3) as usize;
+            // Derived from the layout rather than restated, because the query
+            // box is not a fixed height any more: a short terminal drops its
+            // frame and hands those rows back to the results.
+            let panes = layout::compute(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height,
+                },
+                app.rail,
+            );
+            // The results pane spends two rows on its border and one on the
+            // column header.
+            let expected = panes.results.height.saturating_sub(3) as usize;
             assert_eq!(visible, expected, "wrong visible count at height {height}");
         }
+    }
+
+    #[test]
+    fn the_rail_shows_which_mode_filter_and_sort_are_active() {
+        // The whole point of the rail: state you can see instead of state you
+        // have to remember having pressed a chord for.
+        let app = App {
+            mode: Mode::Bloat,
+            sort: Sort::Size,
+            kind: Kind::DirsOnly,
+            ..Default::default()
+        };
+        let (screen, _) = render(&app, 120, 30);
+
+        for section in ["MODE", "SHOW", "SORT"] {
+            assert!(screen.contains(section), "{section} section missing");
+        }
+        // Every option stays listed, so the alternatives are discoverable
+        // rather than only the current one being named.
+        for label in [
+            "SEARCH", "BLOAT", "DUPES", "ALL", "DIRS", "FILES", "NAME", "SIZE",
+        ] {
+            assert!(screen.contains(label), "{label} missing from the rail");
+        }
+
+        // The marker, not just the colour, says which one is live: it has to
+        // read correctly with no colour at all.
+        let marked: Vec<&str> = screen
+            .lines()
+            .filter(|l| l.contains('\u{25b8}'))
+            .map(|l| l.trim())
+            .collect();
+        assert_eq!(marked.len(), 3, "one marker per section: {marked:?}");
+        assert!(marked.iter().any(|l| l.contains("BLOAT")), "{marked:?}");
+        assert!(marked.iter().any(|l| l.contains("DIRS")), "{marked:?}");
+        assert!(marked.iter().any(|l| l.contains("SIZE")), "{marked:?}");
+    }
+
+    #[test]
+    fn the_rail_yields_its_columns_when_asked_to_and_when_it_must() {
+        let mut app = App::default();
+        app.apply_rows(rows(3), 3, 0, 20);
+
+        // Turned off by the user, at a width that would otherwise allow it.
+        app.rail = false;
+        let (off, _) = render(&app, 120, 30);
+        assert!(!off.contains("SHOW"), "rail drawn after being turned off");
+        // The mode is still reported, just in the border instead.
+        assert!(off.contains("SEARCH"), "mode pills should return");
+
+        // Wanted, but the terminal is too narrow to spare the columns.
+        app.rail = true;
+        let (narrow, _) = render(&app, layout::RAIL_MIN_COLS - 1, 30);
+        assert!(!narrow.contains("SHOW"), "rail drawn on a narrow terminal");
+    }
+
+    #[test]
+    fn the_result_count_is_reported_next_to_the_list() {
+        let mut app = App::default();
+        app.apply_rows(rows(5), 4204, 0, 20);
+        let (screen, _) = render(&app, 120, 30);
+        assert!(
+            screen.contains("1 of 4,204"),
+            "position missing from the results frame"
+        );
     }
 
     #[test]
@@ -805,7 +973,7 @@ mod tests {
         // A selected row is one uniform bar: the selection is the signal.
         let spans = path_spans(r"C:\a\item.bin", "item", true, Color::Cyan, false);
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].style.fg, Some(Color::Black));
+        assert_eq!(spans[0].style.fg, Some(theme().on_accent()));
         assert_eq!(spans[0].style.bg, Some(Color::Cyan));
     }
 
@@ -819,9 +987,15 @@ mod tests {
 
         let (screen, _) = render(&app, 100, 20);
         assert!(screen.contains("TOTAL") && screen.contains("OWN") && screen.contains("SHARE"));
+        // Scoped to the header row rather than the whole screen: the rail
+        // lists MODIFIED as a sort option, which is not a leaked column.
+        let header = screen
+            .lines()
+            .find(|l| l.contains("TOTAL"))
+            .expect("bloat header row");
         assert!(
-            !screen.contains("MODIFIED"),
-            "search columns must not leak in"
+            !header.contains("MODIFIED"),
+            "search columns must not leak in: {header}"
         );
         assert!(screen.contains("largest directories"));
         // The largest row on screen fills the whole bar; smaller ones do not.
@@ -877,11 +1051,41 @@ mod tests {
     }
 
     #[test]
+    fn hints_thin_out_gradually_rather_than_vanishing_at_once() {
+        let app = App::default();
+
+        // Too narrow for every hint, wide enough for the ones that matter.
+        let (mid, _) = render(&app, 140, 12);
+        assert!(mid.contains("Ctrl+S sort"), "core hints dropped too early");
+        assert!(mid.contains("Esc close"));
+        assert!(
+            !mid.contains("Ctrl+B rail"),
+            "the full set should not have fitted"
+        );
+
+        // Narrow enough that only the way out is worth the space.
+        let (narrow, _) = render(&app, 90, 12);
+        assert!(narrow.contains("Esc close"), "the exit hint must survive");
+        assert!(!narrow.contains("Ctrl+S sort"));
+
+        // Narrower still: the hints go entirely rather than crowding out the
+        // counts, which are what the status line is actually for.
+        let (tiny, _) = render(&app, 60, 12);
+        assert!(!tiny.contains("Esc close"));
+        assert!(
+            tiny.contains("match"),
+            "the counts must not be squeezed out"
+        );
+    }
+
+    #[test]
     fn sort_and_filter_state_is_visible() {
         let mut app = App::default();
         app.cycle_sort();
         app.cycle_kind();
-        let (screen, _) = render(&app, 170, 12);
+        // Wide enough for the whole hint set; the tiers below are covered
+        // by their own test.
+        let (screen, _) = render(&app, 180, 12);
         assert!(screen.contains(Sort::Size.label()));
         assert!(screen.contains(Kind::FilesOnly.label()));
         assert!(screen.contains("Tab complete"), "completion hint missing");

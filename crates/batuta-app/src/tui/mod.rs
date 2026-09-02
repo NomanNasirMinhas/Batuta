@@ -15,6 +15,8 @@
 //!   previous result set instead of rescanning the name arena.
 
 pub(crate) mod app;
+pub(crate) mod layout;
+pub(crate) mod theme;
 mod ui;
 
 pub use app::{App, Mode};
@@ -270,6 +272,8 @@ fn handle_key(app: &mut App, key: KeyEvent, visible: usize) {
         KeyCode::Char('w') if ctrl => app.delete_word(),
         KeyCode::Char('s') if ctrl => app.cycle_sort(),
         KeyCode::Char('t') if ctrl => app.cycle_kind(),
+        // Reclaim the rail's columns for paths without leaving the app.
+        KeyCode::Char('b') if ctrl => app.rail = !app.rail,
         // The duplicate scan reads file contents, so it can take a while.
         // Announce it before the request blocks the loop, so the user sees
         // why the UI has gone quiet instead of a frozen result box.

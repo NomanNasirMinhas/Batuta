@@ -147,6 +147,10 @@ pub struct App {
     /// about what is about to go.
     pub confirm_delete: Option<PendingDelete>,
 
+    /// Show the rail. On by default; the layout still withholds it when the
+    /// terminal is too narrow to spare the columns.
+    pub rail: bool,
+
     /// A refetch is needed before the next draw.
     pub dirty: bool,
     pub quit: bool,
@@ -162,6 +166,7 @@ impl Default for App {
             query: String::new(),
             sort: Sort::Name,
             kind: Kind::All,
+            rail: true,
             rows: Vec::new(),
             window_start: 0,
             selected: 0,

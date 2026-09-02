@@ -84,6 +84,7 @@ go.
 | `Tab` | complete the highlighted path (search view only) |
 | `Delete` | delete the highlighted file or folder, after confirming |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | move through results |
+| `Ctrl+B` | show or hide the rail |
 | `Ctrl+D` | jump straight to duplicates (and back) |
 | `Enter` | open the selected entry in Explorer, and close |
 | `Ctrl+W` / `Ctrl+U` | delete a word / clear the query without closing |
@@ -98,10 +99,34 @@ query (with a trailing separator for directories, so you keep narrowing
 inside it) — type `C:\Users`, highlight the account folder you want, press
 `Tab`, type on.
 
+A rail down the left edge shows the mode, the kind filter and the sort order
+all at once, with the active entry in each marked. These were previously
+reachable only through a chord and reported only as text in the status line, so
+the state you were in had to be remembered rather than seen. Nothing in it is
+focusable: the query keeps the keyboard at all times, because typing is the
+primary loop and a focus ring that swallowed keystrokes would be a regression.
+
+The layout gives way in order of what matters least. A terminal under 100
+columns drops the rail, because a file path needs the width more than a filter
+list does, and the mode returns as pills in the frame instead. One too short to
+show the rail's sections in full drops it as well, rather than leaving a `SORT`
+heading with its options clipped off — a half-drawn rail claims state it is not
+showing. Below sixteen rows the query box loses its frame too. `Ctrl+B` takes
+the columns back by hand.
+
 Color carries the reading order rather than decorating. Each mode has its
 own accent that tints the border, the title, the mode pills in the top
 corner, and the selected row, so you know where you are before reading
-anything. Inside results, the part of each path your keystrokes picked out
+anything. Every colour comes from a token set rather than being named where it
+is used, because a bare `Color::Cyan` is whatever the terminal decides it is and
+lands invisible on some light schemes: the palette drops to the sixteen ANSI
+colours when the terminal cannot do better, honours `NO_COLOR`, and picks
+rounded borders only where they actually render rather than as replacement
+boxes. Body text inherits the terminal's own foreground, and nothing has a
+filled background by default — a panel colour would have to know the terminal's
+own background to be safe, and there is no way to ask; set `BATUTA_PANELS` if
+you know yours is dark and want the layered look. Inside results, the part
+of each path your keystrokes picked out
 is bolded in the accent color, directories are tinted, sizes warm toward
 yellow and red as they become worth acting on, the bloat view draws a share
 bar showing each directory's weight against the largest on screen, and the
@@ -294,8 +319,18 @@ hotkeys only honour `Ctrl+Alt+<key>` reliably. So `batuta hotkey` registers the
 combination and parks in `GetMessageW` — one thread blocked in the kernel, no
 CPU. It starts from `HKCU\...\Run` rather than `HKLM`, because a hotkey belongs
 to one session and a machine-wide entry would start a copy for every user who
-logs in. If the combination is already taken, setup says so and offers the
-alternatives instead of reporting a success that will never fire.
+logs in.
+
+Signing in starts many programs at once, all claiming their shortcuts, and
+whoever asks second is refused. Being refused used to kill the helper, so the
+shortcut stayed dead until setup was run again by hand — and because Explorer
+starts Run entries with a console attached, the dead helper left a window
+sitting on the desktop for the rest of the session. It now detaches from that
+console immediately, and retries a refused registration — briskly for the first
+minute, then slowly — so it takes the combination over as soon as whatever held
+it lets go. Anything it cannot do is written to `hotkey.log` beside the index,
+since a background process has nowhere else to report and a shortcut that
+silently does nothing is otherwise impossible to diagnose.
 
 **The index is only rebuilt when it has to be.** Re-running setup to change a
 shortcut should not cost a full rescan, so an existing snapshot is kept when it
@@ -342,7 +377,7 @@ precisely which parts did not happen.
 cargo test --workspace
 ```
 
-352 tests, none of which require elevation. The MFT parser is exercised against
+375 tests, none of which require elevation. The MFT parser is exercised against
 hand-built records covering update-sequence fixups, resident and non-resident
 `$DATA`, fragmented run lists, `$ATTRIBUTE_LIST` spill of both sizes *and*
 names, hard links, DOS 8.3 aliases, alternate data streams, and deliberately
@@ -376,7 +411,14 @@ the two cannot drift apart. The generated `schtasks` command line, the `PATH`
 edit and the ACL are unit-tested separately — the first two because quoting and
 truncation are exactly where they break.
 
-The TUI is tested too. Scroll and window arithmetic is a separate module with
-no terminal involved, and rendering is checked against ratatui's `TestBackend`,
+The TUI is tested too. Layout is a separate module from drawing, so the faults
+that are invisible until they bite — a pane overlapping another, a rail clipped
+to the point of hiding which sort is active, a results area collapsing to
+nothing on a resize — are checked as arithmetic across a range of terminal
+sizes, including ones too small to draw anything at all. The palette is decided
+by a pure function over the environment, so `NO_COLOR`, a terminal that cannot
+do more than sixteen colours, and one that renders rounded borders as
+replacement boxes are all covered without needing that terminal. Scroll and
+window arithmetic is likewise a separate module with no terminal involved, and rendering is checked against ratatui's `TestBackend`,
 which catches layout faults — a status line pushed off screen, a row count that
 disagrees with the space actually available — without needing a real terminal.

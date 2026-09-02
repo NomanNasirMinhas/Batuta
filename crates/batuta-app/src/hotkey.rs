@@ -24,6 +24,24 @@ pub mod modifiers {
 /// The registry value name used for the autostart entry.
 pub const RUN_VALUE: &str = "Batuta Search Hotkey";
 
+/// Attempts spent retrying briskly before backing off to a slow poll.
+const FAST_RETRIES: u32 = 30;
+
+/// How long to wait before trying a refused registration again.
+///
+/// Signing in starts a dozen programs at once, all claiming their shortcuts,
+/// and whoever asks second is simply refused. That is a transient collision,
+/// not a permanent one, so the first minute is retried briskly. After that a
+/// slow poll costs nothing and means the hotkey starts working the moment the
+/// other program lets go, instead of staying dead until setup is run again.
+pub fn retry_delay(attempt: u32) -> std::time::Duration {
+    if attempt < FAST_RETRIES {
+        std::time::Duration::from_secs(2)
+    } else {
+        std::time::Duration::from_secs(30)
+    }
+}
+
 /// A parsed hotkey: modifier bits and a virtual-key code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Combo {
@@ -80,6 +98,7 @@ mod imp {
     use std::ptr;
 
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND};
+    use windows_sys::Win32::System::Console::FreeConsole;
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
         RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
@@ -97,38 +116,86 @@ mod imp {
     /// Register the combination and launch the UI whenever it fires.
     ///
     /// Never returns while it holds the hotkey.
-    pub fn run(spec: &str, exe: &Path) -> io::Result<()> {
+    pub fn run(spec: &str, exe: &Path, log_path: &Path) -> io::Result<()> {
+        // Explorer starts this from the Run key, which gives it a console the
+        // helper has no use for and would otherwise leave sitting on the
+        // desktop for the whole session. Detaching closes it. Nothing is
+        // printed after this point, so the log file is where failures go.
+        unsafe { FreeConsole() };
+
         let Some(combo) = parse(spec) else {
-            return Err(io::Error::other(format!(
-                "'{spec}' is not a usable shortcut"
-            )));
+            let msg = format!("'{spec}' is not a usable shortcut");
+            log(log_path, &msg);
+            return Err(io::Error::other(msg));
         };
 
-        let ok = unsafe {
-            RegisterHotKey(
-                ptr::null_mut::<HWND>() as HWND,
-                HOTKEY_ID,
-                combo.modifiers,
-                combo.key,
-            )
-        };
-        if ok == 0 {
-            // Almost always because another program already owns it. Saying so
-            // beats sitting silently on a shortcut that will never fire.
-            return Err(io::Error::other(format!(
-                "{spec} is already in use by another program"
-            )));
+        // Losing the race at sign-in used to kill the helper outright, which
+        // is why the shortcut needed setup re-run by hand to come back.
+        let mut attempt = 0u32;
+        loop {
+            let ok = unsafe {
+                RegisterHotKey(
+                    ptr::null_mut::<HWND>() as HWND,
+                    HOTKEY_ID,
+                    combo.modifiers,
+                    combo.key,
+                )
+            };
+            if ok != 0 {
+                if attempt > 0 {
+                    log(
+                        log_path,
+                        &format!("{spec} registered after {attempt} retries"),
+                    );
+                }
+                break;
+            }
+            if attempt == 0 {
+                log(
+                    log_path,
+                    &format!("{spec} is held by another program; retrying until it is free"),
+                );
+            }
+            std::thread::sleep(retry_delay(attempt));
+            attempt = attempt.saturating_add(1);
         }
 
         let mut msg: MSG = unsafe { std::mem::zeroed() };
         // Blocks in the kernel until a message arrives: no polling, no CPU.
         while unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) } > 0 {
             if msg.message == WM_HOTKEY {
-                let _ = launch(exe);
+                // Silently doing nothing on a keypress is the one failure the
+                // user cannot diagnose, so it gets recorded.
+                if let Err(e) = launch(exe) {
+                    log(log_path, &format!("could not open the search bar: {e}"));
+                }
             }
         }
         unsafe { UnregisterHotKey(ptr::null_mut::<HWND>() as HWND, HOTKEY_ID) };
         Ok(())
+    }
+
+    /// Append one line to the helper's log.
+    ///
+    /// A detached background process has nowhere else to report to, and a
+    /// hotkey that quietly does nothing is otherwise impossible to explain.
+    /// Best-effort throughout: logging must never take the helper down.
+    fn log(path: &Path, message: &str) {
+        use std::io::Write;
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| crate::fmt::timestamp(d.as_secs() as u32))
+            .unwrap_or_else(|_| "-".into());
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{stamp}  {message}");
+        }
     }
 
     /// Open the UI in its own console window.
@@ -289,6 +356,25 @@ mod tests {
         assert_eq!(parse("ctrl+space"), parse("Ctrl+Space"));
         assert_eq!(parse(" CTRL + SPACE "), parse("Ctrl+Space"));
         assert_eq!(parse("control+space"), parse("Ctrl+Space"));
+    }
+
+    #[test]
+    fn a_refused_registration_is_retried_briskly_then_slowly() {
+        // The sign-in scramble is over in well under a minute, so the fast
+        // window has to cover it; after that the poll only has to be cheap.
+        assert!(retry_delay(0) <= std::time::Duration::from_secs(2));
+        let fast: std::time::Duration = (0..FAST_RETRIES).map(retry_delay).sum();
+        assert!(
+            fast >= std::time::Duration::from_secs(60),
+            "fast retries should cover at least a minute, got {fast:?}"
+        );
+        assert!(retry_delay(FAST_RETRIES) > retry_delay(FAST_RETRIES - 1));
+    }
+
+    #[test]
+    fn retrying_never_gives_up() {
+        // A helper that stopped trying would go back to needing setup re-run.
+        assert!(retry_delay(u32::MAX) > std::time::Duration::ZERO);
     }
 
     #[test]
