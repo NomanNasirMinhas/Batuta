@@ -43,6 +43,9 @@ use batuta_ipc::{Request, Response};
 
 use crate::config::Config;
 use crate::pipe::PipeStream;
+use crate::tui::app::{Exit, PendingDiscard};
+use crate::tui::explorer::state::{Action, Explorer, Focus};
+use crate::tui::explorer::tree::Disk;
 use crate::{query, scan};
 
 /// Where answers come from.
@@ -335,6 +338,16 @@ fn refresh(app: &mut App, backend: &mut Source, visible: usize, dupe_job: &mut O
     // must stay free to switch modes, scroll and quit while it works. Every
     // other refresh in the mode — scrolling, re-entering it — is served by
     // moving the window over the cache.
+    // The explorer reads the disk, not the index, so there is nothing to ask
+    // for here beyond re-flattening the tree for the next frame.
+    if app.mode == Mode::Explore {
+        if let Some(x) = &mut app.explorer {
+            x.sync(&Disk);
+        }
+        app.dirty = false;
+        return;
+    }
+
     if app.mode == Mode::Dupes {
         if app.dupes_pending {
             if dupe_job.is_none() {
@@ -399,6 +412,183 @@ fn refresh(app: &mut App, backend: &mut Source, visible: usize, dupe_job: &mut O
     }
 }
 
+/// Where the explorer opens when there is nothing to seed it from.
+fn home_dir() -> std::path::PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\"))
+}
+
+/// Open the explorer, seeded from whatever is highlighted.
+///
+/// The seeding is the point of the shortcut: finding a file and then having to
+/// navigate back to it by hand would make the two views feel like two separate
+/// programs.
+fn enter_explorer(app: &mut App) {
+    let start = app.current().map(|r| std::path::PathBuf::from(&r.path));
+    let mut file = None;
+    let root = match start {
+        Some(p) if p.is_dir() => p,
+        Some(p) => {
+            let parent = p
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(home_dir);
+            file = Some(p);
+            parent
+        }
+        None => home_dir(),
+    };
+
+    let mut x = Explorer::new(root);
+    if let Some(path) = file {
+        x.tree.reveal(&path);
+        x.load(&path);
+        x.focus = Focus::Editor;
+    }
+    app.explorer = Some(x);
+    app.mode = Mode::Explore;
+    app.status.clear();
+    app.dirty = true;
+}
+
+/// Raise the unsaved-changes prompt if there is anything to lose.
+///
+/// Returns whether it did, so callers can tell "handled, wait for the user"
+/// from "nothing in the way, carry on".
+fn guard_unsaved(app: &mut App, then: Exit) -> bool {
+    let Some(x) = &app.explorer else {
+        return false;
+    };
+    if !x.modified() {
+        return false;
+    }
+    app.confirm_discard = Some(PendingDiscard {
+        path: x
+            .open_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        then,
+    });
+    true
+}
+
+/// Carry out whatever the discard prompt was blocking.
+fn resolve_discard(app: &mut App, save_first: bool) {
+    let Some(pending) = app.confirm_discard.take() else {
+        return;
+    };
+    if save_first {
+        if let Some(x) = &mut app.explorer {
+            app.status = x.save();
+            // A save that failed - read-only, or changed underneath us - must
+            // not then throw the work away anyway.
+            if x.modified() {
+                return;
+            }
+        }
+    }
+    match pending.then {
+        Exit::LeaveExplorer => {
+            app.mode = Mode::Search;
+            app.dirty = true;
+        }
+        Exit::Quit => app.quit = true,
+        Exit::Open(path) => {
+            if let Some(x) = &mut app.explorer {
+                x.load(&path);
+                x.focus = Focus::Editor;
+            }
+        }
+    }
+}
+
+fn leave_explorer(app: &mut App) {
+    if guard_unsaved(app, Exit::LeaveExplorer) {
+        return;
+    }
+    app.mode = Mode::Search;
+    app.dirty = true;
+    app.status.clear();
+}
+
+/// Hand a path to whatever application owns it.
+fn shell_open(path: &std::path::Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    const SHELL_SUCCESS: isize = 32;
+
+    let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let target: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let rc = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    rc > SHELL_SUCCESS
+}
+
+/// Route one key through the explorer.
+fn explorer_key(app: &mut App, key: KeyEvent, visible: usize) {
+    // The escape hatch for a file the editor will not open. Handled here
+    // rather than inside the explorer because launching something is the one
+    // thing the explorer does not own.
+    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+        let target = app.explorer.as_ref().and_then(|x| {
+            x.open_path()
+                .map(std::path::Path::to_path_buf)
+                .or_else(|| x.selected_row().map(|r| r.path.clone()))
+        });
+        app.status = match target {
+            Some(path) if shell_open(&path) => String::new(),
+            Some(path) => format!("nothing is registered to open {}", path.display()),
+            None => "nothing selected".into(),
+        };
+        return;
+    }
+
+    let action = match &mut app.explorer {
+        Some(x) => x.key(key, visible, &Disk),
+        None => Action::Leave,
+    };
+
+    match action {
+        Action::None => {}
+        Action::Save => {
+            if let Some(x) = &mut app.explorer {
+                app.status = x.save();
+            }
+        }
+        Action::Leave => leave_explorer(app),
+        Action::Quit => {
+            if !guard_unsaved(app, Exit::Quit) {
+                app.quit = true;
+            }
+        }
+        Action::Open(path) => {
+            if !guard_unsaved(app, Exit::Open(path.clone())) {
+                if let Some(x) = &mut app.explorer {
+                    x.load(&path);
+                    x.focus = Focus::Editor;
+                }
+            }
+        }
+    }
+}
+
 fn handle_key(app: &mut App, key: KeyEvent, visible: usize) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -413,6 +603,22 @@ fn handle_key(app: &mut App, key: KeyEvent, visible: usize) {
     // A confirmation prompt takes the keyboard entirely. Letting keys through
     // would mean typing into the query behind a dialog, or worse, having
     // Enter mean two different things at once.
+    // Three outcomes, not the delete prompt's two - and `Enter` does nothing
+    // here for the same reason it does nothing there: it is the key most
+    // likely to be hit from habit, and one of these branches throws away work.
+    if app.confirm_discard.is_some() {
+        match key.code {
+            KeyCode::Char('s') | KeyCode::Char('S') => resolve_discard(app, true),
+            KeyCode::Char('d') | KeyCode::Char('D') => resolve_discard(app, false),
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                app.confirm_discard = None;
+                app.status = "still editing".into();
+            }
+            _ => {}
+        }
+        return;
+    }
+
     if app.awaiting_confirmation() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => confirm_delete(app),
@@ -427,6 +633,14 @@ fn handle_key(app: &mut App, key: KeyEvent, visible: usize) {
         return;
     }
 
+    // The explorer owns its keyboard outright. Every binding below is wrong
+    // or dangerous with a text buffer on screen — `Delete` most of all, which
+    // out here removes the highlighted file from disk.
+    if app.mode == Mode::Explore {
+        explorer_key(app, key, visible);
+        return;
+    }
+
     match key.code {
         // Ctrl arms must come before the plain-character arm below, or
         // these letters would be typed into the query instead.
@@ -437,6 +651,7 @@ fn handle_key(app: &mut App, key: KeyEvent, visible: usize) {
         KeyCode::Char('t') if ctrl => app.cycle_kind(),
         // Reclaim the rail's columns for paths without leaving the app.
         KeyCode::Char('b') if ctrl => app.rail = !app.rail,
+        KeyCode::Char('e') if ctrl => enter_explorer(app),
         // The duplicate scan reads file contents, so it can take a while.
         // Announce it before the request blocks the loop, so the user sees
         // why the UI has gone quiet instead of a frozen result box.

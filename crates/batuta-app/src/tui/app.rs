@@ -19,6 +19,13 @@ pub enum Mode {
     /// cache the user refreshes with F5, because a scan reads file contents
     /// and takes seconds, not microseconds.
     Dupes,
+    /// Directory tree, path bar and text editor.
+    ///
+    /// Deliberately outside the `Shift+Tab` cycle below: cycling into an
+    /// editor by accident, or out of one holding unsaved changes, is a trap,
+    /// and `Shift+Tab` means outdent in every editor anyone has used. `Ctrl+E`
+    /// is the way in, `Esc` the way out.
+    Explore,
 }
 
 impl Mode {
@@ -27,6 +34,8 @@ impl Mode {
             Mode::Search => Mode::Bloat,
             Mode::Bloat => Mode::Dupes,
             Mode::Dupes => Mode::Search,
+            // Never reached by the cycle; defined so the function stays total.
+            Mode::Explore => Mode::Search,
         }
     }
 }
@@ -117,6 +126,21 @@ pub struct PendingDelete {
     pub size: u64,
 }
 
+/// Where to go once the user has decided about their unsaved changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exit {
+    LeaveExplorer,
+    Quit,
+    Open(std::path::PathBuf),
+}
+
+/// A file with unsaved changes, and what was being attempted.
+#[derive(Debug, Clone)]
+pub struct PendingDiscard {
+    pub path: String,
+    pub then: Exit,
+}
+
 pub struct App {
     pub mode: Mode,
     pub query: String,
@@ -164,6 +188,16 @@ pub struct App {
     /// second Tab arrives the file is no longer the highlighted row.
     pub pending_file: Option<String>,
 
+    /// The explorer, built the first time it is opened.
+    pub explorer: Option<crate::tui::explorer::state::Explorer>,
+
+    /// A pending "you have unsaved changes" prompt.
+    ///
+    /// Kept separate from `confirm_delete` rather than folded into one modal
+    /// enum: the delete prompt is already proven, and its two-outcome shape is
+    /// not this dialog's three.
+    pub confirm_discard: Option<PendingDiscard>,
+
     /// A refetch is needed before the next draw.
     pub dirty: bool,
     pub quit: bool,
@@ -181,6 +215,8 @@ impl Default for App {
             kind: Kind::All,
             rail: true,
             pending_file: None,
+            explorer: None,
+            confirm_discard: None,
             rows: Vec::new(),
             window_start: 0,
             selected: 0,
@@ -232,7 +268,7 @@ impl App {
     /// Is a confirmation on screen? While it is, ordinary keys must not reach
     /// the query or the result list.
     pub fn awaiting_confirmation(&self) -> bool {
-        self.confirm_delete.is_some()
+        self.confirm_delete.is_some() || self.confirm_discard.is_some()
     }
 
     /// The row under the cursor, if it is currently loaded.
@@ -527,6 +563,9 @@ impl App {
             // A dupes scan is far too expensive to repeat per scroll, so the
             // result is fetched whole, held, and windowed locally. Only a
             // pending scan issues this request at all.
+            // The explorer reads the disk directly and never queries the
+            // index; `refresh` returns before this is reached.
+            Mode::Explore => Request::Status,
             Mode::Dupes => Request::Dupes {
                 min_size: DUPES_MIN_SIZE,
                 top: DUPES_TOP,

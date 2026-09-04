@@ -202,10 +202,6 @@ impl Buffer {
         self.lines.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.lines.len() == 1 && self.lines[0].is_empty()
-    }
-
     pub fn cursor(&self) -> Cursor {
         self.cursor
     }
@@ -225,12 +221,6 @@ impl Buffer {
 
     pub fn modified(&self) -> bool {
         self.saved_at != Some(self.undo.len())
-    }
-
-    /// The document as one string, lines joined with `\n`, for display and
-    /// searching. Not what gets written — see [`Buffer::to_bytes`].
-    pub fn text(&self) -> String {
-        self.lines.join("\n")
     }
 
     /// The document as the bytes it should occupy on disk.
@@ -537,6 +527,16 @@ impl Buffer {
     pub fn goto(&mut self, at: Cursor) {
         self.moved();
         self.cursor = self.clamp(at);
+    }
+}
+
+/// Reading the whole document as one string is only ever wanted by tests;
+/// the app writes bytes and draws lines. Keeping it here rather than on the
+/// main impl stops it looking like API someone should be using.
+#[cfg(test)]
+impl Buffer {
+    pub fn text(&self) -> String {
+        self.lines.join("\n")
     }
 }
 

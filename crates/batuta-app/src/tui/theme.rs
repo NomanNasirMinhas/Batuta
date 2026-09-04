@@ -213,9 +213,11 @@ impl Theme {
             (Palette::True, Mode::Search) => Color::Rgb(56, 189, 248),
             (Palette::True, Mode::Bloat) => Color::Rgb(192, 132, 252),
             (Palette::True, Mode::Dupes) => Color::Rgb(250, 204, 21),
+            (Palette::True, Mode::Explore) => Color::Rgb(74, 222, 128),
             (Palette::Ansi, Mode::Search) => Color::Cyan,
             (Palette::Ansi, Mode::Bloat) => Color::LightMagenta,
             (Palette::Ansi, Mode::Dupes) => Color::Yellow,
+            (Palette::Ansi, Mode::Explore) => Color::Green,
         }
     }
 

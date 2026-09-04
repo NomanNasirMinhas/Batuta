@@ -13,7 +13,8 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table};
 
-use super::app::{App, DupeEntry, Kind, Mode, Sort, DUPES_MIN_SIZE};
+use super::app::{App, DupeEntry, Kind, Mode, PendingDiscard, Sort, DUPES_MIN_SIZE};
+use super::explorer::state::{Explorer, Focus};
 use super::layout::{self, Panes};
 use super::theme::theme;
 use crate::fmt;
@@ -85,6 +86,12 @@ fn selected_style(i: usize, cursor: Option<usize>, accent: Color) -> Style {
 
 /// Draw a frame; returns how many result rows are visible.
 pub fn draw(f: &mut Frame, app: &App) -> usize {
+    // The explorer is a different screen, not a different table, so it is
+    // routed before the query/results layout runs at all.
+    if app.mode == Mode::Explore {
+        return draw_explorer(f, app);
+    }
+
     let panes = layout::compute(f.area(), app.rail);
 
     // Painted first so every pane sits on a known ground rather than on
@@ -108,6 +115,321 @@ pub fn draw(f: &mut Frame, app: &App) -> usize {
         draw_delete_confirm(f, f.area(), pending);
     }
     visible
+}
+
+/// The explorer: a tree, an editor, and a path bar.
+///
+/// Returns how many editor lines fit, which the event loop feeds back in the
+/// same way the result list's row count is.
+fn draw_explorer(f: &mut Frame, app: &App) -> usize {
+    let panes = layout::explorer(f.area(), true);
+    f.render_widget(Block::default().style(base_style()), f.area());
+
+    let accent = mode_accent(Mode::Explore);
+    let Some(x) = &app.explorer else {
+        return 0;
+    };
+
+    if let Some(area) = panes.tree {
+        draw_tree(f, area, x, accent);
+    }
+    let visible = draw_editor(f, panes.editor, x, accent);
+    draw_path_bar(f, panes.path, x, accent, panes.compact);
+    draw_explore_status(f, panes.status, app, x);
+
+    if let Some(pending) = &app.confirm_discard {
+        draw_discard_confirm(f, f.area(), pending);
+    }
+    visible
+}
+
+/// A pane's frame: the mode accent when it has the keyboard, dim when it does
+/// not. Focus has to be visible without reading anything.
+fn pane(focused: bool, accent: Color, title: &str) -> Block<'static> {
+    let border = if focused { accent } else { theme().border() };
+    panel(border).title_top(Span::styled(
+        format!(" {title} "),
+        Style::default().fg(border).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn draw_tree(f: &mut Frame, area: Rect, x: &Explorer, accent: Color) {
+    let focused = x.focus == Focus::Tree;
+    let inner = area.height.saturating_sub(2) as usize;
+    let start = x.tree.window_start.min(x.tree.selected);
+    let start = if x.tree.selected >= start + inner.max(1) {
+        x.tree.selected + 1 - inner.max(1)
+    } else {
+        start
+    };
+
+    let lines: Vec<Line> = x
+        .rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(inner)
+        .map(|(i, row)| {
+            let selected = i == x.tree.selected;
+            let style = if selected && focused {
+                Style::default().bg(accent).fg(theme().on_accent())
+            } else if row.is_dir {
+                Style::default().fg(accent)
+            } else {
+                Style::default().fg(theme().text())
+            };
+
+            if let Some(why) = &row.error {
+                // An unreadable directory drawn as an empty one sends people
+                // hunting for files that are right there.
+                return Line::from(Span::styled(
+                    format!("{}  <{why}>", "  ".repeat(row.depth)),
+                    Style::default().fg(theme().warn()),
+                ));
+            }
+            let marker = if !row.is_dir {
+                "  "
+            } else if row.expanded {
+                "\u{25be} "
+            } else {
+                "\u{25b8} "
+            };
+            Line::from(Span::styled(
+                format!("{}{marker}{}", "  ".repeat(row.depth), row.name),
+                style,
+            ))
+        })
+        .collect();
+
+    f.render_widget(
+        Paragraph::new(lines).block(pane(focused, accent, "tree")),
+        area,
+    );
+}
+
+fn draw_editor(f: &mut Frame, area: Rect, x: &Explorer, accent: Color) -> usize {
+    let focused = x.focus == Focus::Editor;
+    let visible = area.height.saturating_sub(2) as usize;
+
+    let title = match (&x.doc, &x.notice) {
+        (Some(doc), _) => {
+            let name = doc.path.display().to_string();
+            if doc.buffer.modified() {
+                format!("{name}  \u{2022} modified")
+            } else {
+                name
+            }
+        }
+        (None, Some(_)) => "cannot edit".to_string(),
+        (None, None) => "no file open".to_string(),
+    };
+    let block = pane(focused, accent, &title);
+
+    let Some(doc) = &x.doc else {
+        let msg = x
+            .notice
+            .clone()
+            .unwrap_or_else(|| "Pick a file in the tree, or type a path below.".to_string());
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(msg, Style::default().fg(theme().warn())))
+                    .alignment(Alignment::Center),
+                Line::raw(""),
+                Line::from(Span::styled(
+                    "Shift+Enter opens it in its default application",
+                    Style::default().fg(dim()),
+                ))
+                .alignment(Alignment::Center),
+            ])
+            .block(block),
+            area,
+        );
+        return visible;
+    };
+
+    // Line numbers are width-matched to the file, so the text does not shift
+    // sideways as you scroll past line 100.
+    let width = doc.buffer.len().to_string().len();
+    let caret = doc.buffer.cursor();
+
+    let lines: Vec<Line> = doc
+        .buffer
+        .lines()
+        .iter()
+        .enumerate()
+        .skip(x.top_line)
+        .take(visible)
+        .map(|(n, text)| {
+            let here = n == caret.line;
+            Line::from(vec![
+                Span::styled(
+                    format!("{:>width$} ", n + 1),
+                    Style::default().fg(if here { accent } else { theme().dim() }),
+                ),
+                Span::styled(text.clone(), Style::default().fg(theme().text())),
+            ])
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+
+    // The real terminal caret, not a drawn glyph: it survives the terminal's
+    // own selection rendering and is what assistive tooling follows.
+    if focused {
+        let row = caret.line.saturating_sub(x.top_line) as u16;
+        let col = (width as u16 + 1) + caret.col as u16;
+        if row < visible as u16 && col < area.width.saturating_sub(2) {
+            f.set_cursor_position((area.x + 1 + col, area.y + 1 + row));
+        }
+    }
+    visible
+}
+
+fn draw_path_bar(f: &mut Frame, area: Rect, x: &Explorer, accent: Color, compact: bool) {
+    let focused = x.focus == Focus::Path;
+    let text = Line::from(Span::styled(
+        x.path_text.clone(),
+        Style::default().fg(theme().text()),
+    ));
+
+    if compact {
+        f.render_widget(Paragraph::new(text), area);
+    } else {
+        f.render_widget(
+            Paragraph::new(text).block(pane(focused, accent, "path")),
+            area,
+        );
+    }
+
+    if focused {
+        let col = x.path_caret as u16;
+        let (bx, by) = if compact {
+            (area.x, area.y)
+        } else {
+            (area.x + 1, area.y + 1)
+        };
+        if col < area.width.saturating_sub(2) {
+            f.set_cursor_position((bx + col, by));
+        }
+    }
+}
+
+fn draw_explore_status(f: &mut Frame, area: Rect, app: &App, x: &Explorer) {
+    let mut left = Vec::new();
+    if !app.status.is_empty() {
+        left.push(Span::styled(
+            app.status.clone(),
+            Style::default().fg(theme().warn()),
+        ));
+    } else if let Some(doc) = &x.doc {
+        let caret = doc.buffer.cursor();
+        left.push(Span::styled(
+            format!("line {} col {}", caret.line + 1, caret.col + 1),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        left.push(Span::styled(
+            format!("  ·  {} lines", fmt::count(doc.buffer.len() as u64)),
+            Style::default().fg(dim()),
+        ));
+        left.push(Span::styled(
+            format!("  ·  {}", doc.buffer.dominant().label()),
+            Style::default().fg(dim()),
+        ));
+        if doc.buffer.mixed_endings() {
+            // Worth saying out loud: it changes what a save looks like in a
+            // diff, and it is invisible otherwise.
+            left.push(Span::styled(
+                "  ·  mixed endings",
+                Style::default().fg(theme().warn()),
+            ));
+        }
+        if doc.buffer.modified() {
+            left.push(Span::styled(
+                "  ·  unsaved",
+                Style::default().fg(theme().danger()),
+            ));
+        }
+    } else {
+        left.push(Span::styled(
+            x.tree.root().display().to_string(),
+            Style::default().fg(dim()),
+        ));
+    }
+
+    // Naming a key that would do nothing teaches the wrong thing, so undo
+    // and redo appear only when there is something to undo or redo.
+    let undo = x.doc.as_ref().is_some_and(|d| d.buffer.can_undo());
+    let redo = x.doc.as_ref().is_some_and(|d| d.buffer.can_redo());
+    let mut full = String::from("Ctrl+S save");
+    if undo {
+        full.push_str("  Ctrl+Z undo");
+    }
+    if redo {
+        full.push_str("  Ctrl+Y redo");
+    }
+    full.push_str("  Shift+Enter open  F5 refresh  Esc back");
+    let some = "Ctrl+S save  Esc back";
+
+    let keys = [full.as_str(), some, "Esc back"]
+        .into_iter()
+        .find(|k| area.width >= k.chars().count() as u16 + 30);
+
+    let Some(keys) = keys else {
+        f.render_widget(Paragraph::new(Line::from(left)), area);
+        return;
+    };
+    let chunks = Layout::horizontal([
+        Constraint::Min(30),
+        Constraint::Length(keys.chars().count() as u16),
+    ])
+    .split(area);
+
+    f.render_widget(Paragraph::new(Line::from(left)), chunks[0]);
+    f.render_widget(
+        Paragraph::new(Span::styled(keys, Style::default().fg(dim()))).alignment(Alignment::Right),
+        chunks[1],
+    );
+}
+
+/// The unsaved-changes prompt.
+///
+/// Three outcomes, not two, and — like the delete prompt — `Enter` does
+/// nothing at all: it is the key most likely to be hit from habit, and one of
+/// these branches throws away work.
+fn draw_discard_confirm(f: &mut Frame, area: Rect, pending: &PendingDiscard) {
+    let box_area = centered(area, 72, 9);
+    f.render_widget(Clear, box_area);
+
+    let text = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "This file has unsaved changes.",
+            Style::default()
+                .fg(theme().danger())
+                .add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center),
+        Line::raw(""),
+        Line::from(Span::raw(pending.path.clone())).alignment(Alignment::Center),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "S save and continue    D discard them    Esc stay here",
+            Style::default().fg(dim()),
+        ))
+        .alignment(Alignment::Center),
+    ];
+
+    f.render_widget(
+        Paragraph::new(text).block(
+            panel(theme().danger()).title_top(Span::styled(
+                " unsaved changes ",
+                Style::default()
+                    .fg(theme().danger())
+                    .add_modifier(Modifier::BOLD),
+            )),
+        ),
+        box_area,
+    );
 }
 
 /// Centre a box of the given size inside `area`.
@@ -307,6 +629,7 @@ fn draw_query(f: &mut Frame, area: Rect, app: &App, panes: &Panes) {
         Mode::Search => " batuta · search ",
         Mode::Bloat => " batuta · bloat (largest directories) ",
         Mode::Dupes => " batuta · duplicates (byte-identical files) ",
+        Mode::Explore => " batuta · explore ",
     };
 
     let prompt = match app.mode {
@@ -319,6 +642,7 @@ fn draw_query(f: &mut Frame, area: Rect, app: &App, panes: &Panes) {
             "each file with the paths holding identical copies — F5 rescan, Shift+Tab modes",
             Style::default().fg(dim()),
         )]),
+        Mode::Explore => Line::from(Span::raw("")),
     };
 
     // A short terminal cannot afford two rows of frame around one row of
@@ -429,7 +753,9 @@ fn draw_results(f: &mut Frame, area: Rect, app: &App) -> usize {
                         .collect()
                 },
             ),
-            Mode::Dupes => (
+            // Never drawn: `draw` sends Explore to its own screen. Present
+            // so the match stays total.
+            Mode::Explore | Mode::Dupes => (
                 vec!["SIZE", "COPIES", "PATH"],
                 vec![
                     Constraint::Length(10),
@@ -811,7 +1137,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let state = format!("sort:{}  show:{}", app.sort.label(), app.kind.label());
-    let full = format!("{state}  │ Tab complete  Shift+Tab modes  Ctrl+S sort  Ctrl+T filter  Ctrl+B rail  Ctrl+D dupes  Enter reveal  Shift+Enter open  Esc close");
+    let full = format!("{state}  │ Tab complete  Shift+Tab modes  Ctrl+S sort  Ctrl+T filter  Ctrl+B rail  Ctrl+D dupes  Ctrl+E explore  Enter reveal  Shift+Enter open  Esc close");
     // Two middle tiers, so the hints thin out a rung at a time rather than
     // falling off a cliff from everything to nothing. The rungs drop what is
     // most guessable first: the rail and the duplicates shortcut before the
@@ -932,6 +1258,146 @@ mod tests {
             let expected = panes.results.height.saturating_sub(3) as usize;
             assert_eq!(visible, expected, "wrong visible count at height {height}");
         }
+    }
+
+    fn explorer_fixture() -> App {
+        use crate::tui::explorer::buffer::Buffer;
+        use crate::tui::explorer::state::{Doc, Explorer};
+        use crate::tui::explorer::tree::Row as TreeRow;
+        use std::path::PathBuf;
+
+        let mut x = Explorer::new(PathBuf::from(r"D:\Code\Batuta"));
+        let mk = |p: &str, name: &str, depth: usize, is_dir: bool, expanded: bool| TreeRow {
+            path: PathBuf::from(p),
+            name: name.into(),
+            depth,
+            is_dir,
+            expanded,
+            error: None,
+        };
+        x.rows = vec![
+            mk(r"D:\Code\Batuta\crates", "crates", 0, true, true),
+            mk(r"D:\Code\Batuta\crates\app", "app", 1, true, false),
+            mk(r"D:\Code\Batuta\crates\core", "core", 1, true, false),
+            mk(r"D:\Code\Batuta\src", "src", 0, true, true),
+            mk(r"D:\Code\Batuta\src\main.rs", "main.rs", 1, false, false),
+            mk(r"D:\Code\Batuta\README.md", "README.md", 0, false, false),
+            mk(r"D:\Code\Batuta\Cargo.toml", "Cargo.toml", 0, false, false),
+        ];
+        x.tree.selected = 4;
+        x.path_text = r"D:\Code\Batuta\src\main.rs".into();
+
+        let mut buffer = Buffer::from_str(
+            "use std::fs;\n\nfn main() {\n    let path = \"notes.txt\";\n    \
+             println!(\"{path}\");\n}\n",
+        );
+        buffer.goto(crate::tui::explorer::buffer::Cursor::new(3, 8));
+        buffer.insert_char('!');
+        x.doc = Some(Doc {
+            path: PathBuf::from(r"D:\Code\Batuta\src\main.rs"),
+            buffer,
+            stamp: None,
+        });
+        x.focus = crate::tui::explorer::state::Focus::Editor;
+
+        App {
+            mode: Mode::Explore,
+            explorer: Some(x),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_explorer_draws_its_three_panes() {
+        let app = explorer_fixture();
+        let (screen, visible) = render(&app, 118, 22);
+
+        assert!(screen.contains("tree"), "tree pane missing");
+        assert!(screen.contains("path"), "path bar missing");
+        assert!(screen.contains("main.rs"), "the open file should be named");
+        assert!(screen.contains("use std::fs;"), "file contents missing");
+        assert!(screen.contains("crates"), "tree contents missing");
+        assert!(
+            screen.contains("modified"),
+            "an unsaved buffer has to say so"
+        );
+        assert!(visible > 0, "the editor must report how many lines fit");
+    }
+
+    #[test]
+    fn a_directory_shows_whether_it_is_open() {
+        // The marker carries it as well as the colour, so it survives a
+        // terminal with no colour at all.
+        let app = explorer_fixture();
+        let (screen, _) = render(&app, 118, 22);
+        assert!(screen.contains("\u{25be} crates"), "an open directory");
+        assert!(screen.contains("\u{25b8} app"), "a closed one");
+    }
+
+    #[test]
+    fn the_editor_keeps_the_columns_when_the_tree_cannot_have_them() {
+        let app = explorer_fixture();
+        let (screen, _) = render(&app, 80, 22);
+        assert!(
+            !screen.contains("\u{25be} crates"),
+            "the tree should be gone"
+        );
+        assert!(
+            screen.contains("use std::fs;"),
+            "the file still has to be readable"
+        );
+    }
+
+    #[test]
+    fn the_status_line_reports_where_the_caret_is_and_what_the_file_uses() {
+        let app = explorer_fixture();
+        let (screen, _) = render(&app, 118, 22);
+        assert!(screen.contains("line 4 col 10"), "caret position missing");
+        assert!(screen.contains("LF"), "line ending missing");
+        assert!(screen.contains("unsaved"));
+    }
+
+    #[test]
+    fn the_discard_prompt_offers_three_outcomes_and_never_enter() {
+        // Enter is the key most likely to be hit from habit, and one of these
+        // branches throws away work.
+        let mut app = explorer_fixture();
+        app.confirm_discard = Some(crate::tui::app::PendingDiscard {
+            path: r"D:\Code\Batuta\src\main.rs".into(),
+            then: crate::tui::app::Exit::LeaveExplorer,
+        });
+        let (screen, _) = render(&app, 118, 22);
+
+        assert!(screen.contains("unsaved changes"));
+        assert!(screen.contains("S save"), "saving must be offered");
+        assert!(screen.contains("D discard"), "discarding must be offered");
+        assert!(screen.contains("Esc stay here"), "so must backing out");
+        // Scoped to the dialog's own line: the status bar behind it still
+        // says "Shift+Enter open", which is not the prompt offering Enter.
+        let options = screen
+            .lines()
+            .find(|l| l.contains("S save and continue"))
+            .expect("the options line");
+        assert!(
+            !options.contains("Enter"),
+            "offering Enter on a destructive prompt is the bug this avoids: {options}"
+        );
+    }
+
+    #[test]
+    fn a_file_the_editor_will_not_open_says_why_and_offers_the_way_out() {
+        let mut app = explorer_fixture();
+        if let Some(x) = &mut app.explorer {
+            x.doc = None;
+            x.notice = Some("This file contains NUL bytes, so it is not text.".into());
+        }
+        let (screen, _) = render(&app, 118, 22);
+
+        assert!(screen.contains("NUL bytes"), "the reason has to be shown");
+        assert!(
+            screen.contains("Shift+Enter"),
+            "and the way to open it anyway"
+        );
     }
 
     #[test]

@@ -85,6 +85,64 @@ pub fn compute(area: Rect, rail_wanted: bool) -> Panes {
     }
 }
 
+/// Columns the directory tree occupies when shown.
+pub const TREE_WIDTH: u16 = 30;
+
+/// Below this width the tree is dropped. The editor needs the columns more:
+/// a tree can be reached from the path bar, but wrapped code cannot be read.
+pub const TREE_MIN_COLS: u16 = 90;
+
+/// Rows the path bar takes with and without its frame.
+const PATH_FRAMED: u16 = 3;
+const PATH_BARE: u16 = 1;
+
+/// Where the explorer's panes go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExplorerPanes {
+    /// The directory tree, or `None` when the terminal is too narrow.
+    pub tree: Option<Rect>,
+    pub editor: Rect,
+    pub path: Rect,
+    pub status: Rect,
+    pub compact: bool,
+}
+
+/// Divide `area` into the explorer's panes.
+///
+/// Same degradation rule as [`compute`]: drop the least important thing first.
+/// Here that is the tree, then the path bar's frame.
+pub fn explorer(area: Rect, tree_wanted: bool) -> ExplorerPanes {
+    let compact = area.height <= COMPACT_MAX_ROWS;
+    let path_h = if compact { PATH_BARE } else { PATH_FRAMED };
+
+    // Status first and full width, then the path bar above it: both span the
+    // whole terminal, because a path is the longest string on screen and the
+    // one that suffers most from being boxed in.
+    let rows = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(path_h),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let (main, path, status) = (rows[0], rows[1], rows[2]);
+
+    let (tree, editor) = if tree_wanted && area.width >= TREE_MIN_COLS {
+        let cols =
+            Layout::horizontal([Constraint::Length(TREE_WIDTH), Constraint::Min(1)]).split(main);
+        (Some(cols[0]), cols[1])
+    } else {
+        (None, main)
+    };
+
+    ExplorerPanes {
+        tree,
+        editor,
+        path,
+        status,
+        compact,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +174,79 @@ mod tests {
 
     fn overlaps(a: Rect, b: Rect) -> bool {
         a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+    }
+
+    #[test]
+    fn the_explorer_gives_every_pane_room_when_there_is_room() {
+        let a = area(140, 40);
+        let p = explorer(a, true);
+        assert!(p.tree.is_some());
+        assert_eq!(p.tree.unwrap().width, TREE_WIDTH);
+        assert_eq!(p.path.width, a.width, "a path deserves the whole width");
+        assert_eq!(p.status.height, 1);
+        assert!(!p.compact);
+    }
+
+    #[test]
+    fn the_explorer_tree_gives_way_before_the_editor_does() {
+        let a = area(TREE_MIN_COLS - 1, 40);
+        let p = explorer(a, true);
+        assert!(p.tree.is_none());
+        assert_eq!(p.editor.width, a.width, "the editor takes the columns");
+    }
+
+    #[test]
+    fn a_short_terminal_unframes_the_explorer_path_bar() {
+        let a = area(120, COMPACT_MAX_ROWS);
+        let p = explorer(a, true);
+        assert!(p.compact);
+        assert_eq!(p.path.height, PATH_BARE);
+
+        let tall = explorer(area(120, COMPACT_MAX_ROWS + 1), true);
+        assert_eq!(
+            p.editor.height,
+            tall.editor.height + 1,
+            "the rows saved must reach the editor"
+        );
+    }
+
+    #[test]
+    fn explorer_panes_never_overlap_and_stay_inside_the_frame() {
+        for (w, h) in [(140, 40), (89, 40), (140, 12), (60, 8), (200, 60)] {
+            let a = area(w, h);
+            let p = explorer(a, true);
+            let mut all = vec![("editor", p.editor), ("path", p.path), ("status", p.status)];
+            if let Some(t) = p.tree {
+                all.push(("tree", t));
+            }
+            for (i, (an, ar)) in all.iter().enumerate() {
+                for (bn, br) in all.iter().skip(i + 1) {
+                    assert!(!overlaps(*ar, *br), "{an} overlaps {bn} at {w}x{h}");
+                }
+            }
+            for (n, r) in &all {
+                assert!(
+                    r.x + r.width <= a.x + a.width && r.y + r.height <= a.y + a.height,
+                    "{n} escapes the frame at {w}x{h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_explorer_in_a_terminal_too_small_for_it_still_produces_valid_panes() {
+        // A resize can make the terminal arbitrarily small for one frame, and
+        // ratatui panics on a rect that leaves the buffer.
+        for (w, h) in [(1, 1), (2, 2), (10, 3), (200, 1)] {
+            let a = area(w, h);
+            let p = explorer(a, true);
+            for r in [p.editor, p.path, p.status] {
+                assert!(
+                    r.x + r.width <= a.x + a.width && r.y + r.height <= a.y + a.height,
+                    "{r:?} escapes {a:?}"
+                );
+            }
+        }
     }
 
     #[test]

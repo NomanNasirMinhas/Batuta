@@ -86,6 +86,7 @@ go.
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | move through results |
 | `Ctrl+B` | show or hide the rail |
 | `Ctrl+D` | jump straight to duplicates (and back) |
+| `Ctrl+E` | open the explorer on the highlighted entry |
 | `Enter` | reveal the selected entry in Explorer, and close |
 | `Shift+Enter` | open it: a folder in Explorer, a file in its own application |
 | `Ctrl+W` / `Ctrl+U` | delete a word / clear the query without closing |
@@ -141,6 +142,82 @@ show the rail's sections in full drops it as well, rather than leaving a `SORT`
 heading with its options clipped off — a half-drawn rail claims state it is not
 showing. Below sixteen rows the query box loses its frame too. `Ctrl+B` takes
 the columns back by hand.
+
+## Explorer
+
+`Ctrl+E` opens a directory tree, a text editor and an editable path bar,
+seeded from whatever is highlighted: a file opens in the editor with its
+folder in the tree, a directory opens there. Finding something and then having
+to leave to look at it was the gap — every other way out of the result list
+hands the file to another program.
+
+It is deliberately **not** in the `Shift+Tab` cycle. Cycling into an editor by
+accident, or out of one holding unsaved changes, is a trap, and `Shift+Tab`
+means outdent in every editor anyone has used. `Ctrl+E` goes in, `Esc` comes
+back.
+
+The explorer owns its keyboard outright rather than sharing the search view's.
+That is not tidiness: out there `Delete` removes the highlighted **file from
+disk**, `Ctrl+S` cycles the sort order, `Enter` opens Explorer and quits, and
+`Esc` exits the program — all of which are wrong or dangerous with a text
+buffer on screen. Guarding each one individually would leave the dangerous
+ones a single missed guard away from firing.
+
+| key | |
+|---|---|
+| arrows | move within a pane; cross to the next one at its edge |
+| `Ctrl+Left` / `Ctrl+Right` | cross regardless of position |
+| `Enter` | expand a directory, open a file, or go to a typed path |
+| `Shift+Enter` | open in the default application |
+| `Ctrl+S` | save |
+| `Ctrl+Z` / `Ctrl+Y` | undo / redo |
+| `F5` | re-read the directory |
+| `Esc` | back to search |
+
+Arrow-crossing has two deliberate exceptions, both because the literal rule is
+worse. The editor crosses left only at the very start of the buffer — at any
+other line's column 0 it goes to the end of the line above, as every editor
+does, because losing focus during the commonest motion in text editing is
+infuriating. And the path bar never crosses sideways at all: it is a text
+field, and Left and Right are how you edit one.
+
+The tree reads the disk rather than the index, which is the only place in
+Batuta that does. The index excludes `C:\Windows` and both `Program Files`
+directories, and a file explorer that cannot show you `C:\Windows` is broken;
+it can also be a snapshot, and a tree is exactly where staleness is noticed.
+A directory that cannot be read says so on its row instead of appearing empty,
+because an empty `C:\System Volume Information` is a lie.
+
+**Opening a file and saving it untouched produces identical bytes.** Line
+endings are kept per line, not normalised: files with mixed CRLF and LF are
+real — a merge artefact, or one touched by both WSL and Notepad — and
+rewriting the lines you did not touch turns a one-character fix into a
+whole-file diff, and in a repository a whole-file conflict. The trailing
+newline and a UTF-8 BOM are preserved exactly as found, never added and never
+removed.
+
+Whether a file is text is decided by more than a UTF-8 check, because `NUL` is
+a legal codepoint and plenty of binaries decode cleanly: a NUL scan comes
+first, then a control-character ratio. UTF-16 is refused **by name** — it is
+common on Windows, from Notepad's "Unicode" or a PowerShell redirect, and
+telling someone their file is invalid would be misleading. Anything refused
+shows why, with `Shift+Enter` to open it in the application that does
+understand it.
+
+Saving writes a temp file beside the target, flushes it to the device, and
+then calls `ReplaceFileW`. Not a rename: a rename hands the file the temp's
+freshly inherited permissions, silently discarding any the user set
+deliberately. The flush is what stops an atomic replace from committing an
+empty file after a power cut. A file that changed on disk since it was opened,
+or one marked read-only, is refused rather than overwritten.
+
+Leaving with unsaved changes asks first, with three answers rather than two —
+save, discard, or stay — and `Enter` deliberately does nothing, because it is
+the key most likely to be hit from habit and one of those branches throws work
+away.
+
+Not yet done: find-in-file, and syntax highlighting and formatters are out of
+scope by choice.
 
 Color carries the reading order rather than decorating. Each mode has its
 own accent that tints the border, the title, the mode pills in the top
@@ -422,7 +499,7 @@ precisely which parts did not happen.
 cargo test --workspace
 ```
 
-401 tests, none of which require elevation. The MFT parser is exercised against
+476 tests, none of which require elevation. The MFT parser is exercised against
 hand-built records covering update-sequence fixups, resident and non-resident
 `$DATA`, fragmented run lists, `$ATTRIBUTE_LIST` spill of both sizes *and*
 names, hard links, DOS 8.3 aliases, alternate data streams, and deliberately

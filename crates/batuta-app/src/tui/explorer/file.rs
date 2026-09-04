@@ -273,26 +273,53 @@ fn replace_file(target: &Path, replacement: &Path) -> io::Result<()> {
             .collect()
     }
 
+    /// The replace could not delete the original.
+    const ERROR_UNABLE_TO_REMOVE_REPLACED: i32 = 1175;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+
     let (t, r) = (wide(target), wide(replacement));
     // `ReplaceFileW`, not a rename. A rename deletes the destination and moves
     // the temp into its place, so the file ends up with the temp's freshly
     // inherited ACL, creation time and short name. Any permission the user
     // deliberately set on that file is silently discarded. `ReplaceFileW`
     // exists precisely to merge the new data into the old identity.
-    let ok = unsafe {
-        ReplaceFileW(
-            t.as_ptr(),
-            r.as_ptr(),
-            ptr::null(),
-            0,
-            ptr::null(),
-            ptr::null(),
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
+    // Antivirus scanners, search indexers and backup agents open a file
+    // moments after it is written, and while they hold it the replace cannot
+    // delete the original. That is transient and common enough that failing
+    // the save outright would make editing feel unreliable, so it is retried
+    // briefly. Anything still failing after that is a real error and is
+    // reported: quietly falling back to a plain rename would reintroduce the
+    // permission loss this function exists to avoid.
+    let mut last = io::Error::other("replace failed");
+    for attempt in 0..5 {
+        let ok = unsafe {
+            ReplaceFileW(
+                t.as_ptr(),
+                r.as_ptr(),
+                ptr::null(),
+                0,
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+
+        last = io::Error::last_os_error();
+        let transient = matches!(
+            last.raw_os_error(),
+            Some(ERROR_UNABLE_TO_REMOVE_REPLACED)
+                | Some(ERROR_SHARING_VIOLATION)
+                | Some(ERROR_ACCESS_DENIED)
+        );
+        if !transient {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
     }
-    Ok(())
+    Err(last)
 }
 
 #[cfg(not(windows))]
