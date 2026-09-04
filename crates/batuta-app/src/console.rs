@@ -146,6 +146,113 @@ pub fn float() {
 #[cfg(not(windows))]
 pub fn float() {}
 
+/// What the title bar's buttons do to the real window.
+///
+/// Drawing controls that only look like controls would be worse than drawing
+/// none, so these reach the actual window the same way the frame-stripping in
+/// [`float`] does.
+#[cfg(windows)]
+pub fn minimize() {
+    show(windows_sys::Win32::UI::WindowsAndMessaging::SW_MINIMIZE);
+}
+
+/// Toggle between filling the work area and the floating size.
+///
+/// A borderless window has no frame for Windows to maximise against, so this
+/// resizes it to the work area by hand and remembers where it was.
+#[cfg(windows)]
+pub fn toggle_maximize() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SetWindowPos, SystemParametersInfoW, HWND_TOP, SPI_GETWORKAREA,
+        SWP_SHOWWINDOW,
+    };
+
+    static MAXIMIZED: AtomicBool = AtomicBool::new(false);
+    static PREVIOUS: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
+
+    let hwnd = unsafe { GetConsoleWindow() };
+    if hwnd.is_null() {
+        return;
+    }
+
+    let mut work = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            &mut work as *mut RECT as *mut core::ffi::c_void,
+            0,
+        )
+    } == 0
+    {
+        return;
+    }
+
+    if MAXIMIZED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        // Back to wherever it was before, if that was recorded.
+        if let Ok(mut prev) = PREVIOUS.lock() {
+            if let Some((x, y, w, h)) = prev.take() {
+                unsafe { SetWindowPos(hwnd, HWND_TOP, x, y, w, h, SWP_SHOWWINDOW) };
+                return;
+            }
+        }
+    }
+
+    let mut now = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if unsafe { GetWindowRect(hwnd, &mut now) } != 0 {
+        if let Ok(mut prev) = PREVIOUS.lock() {
+            *prev = Some((
+                now.left,
+                now.top,
+                now.right - now.left,
+                now.bottom - now.top,
+            ));
+        }
+    }
+    MAXIMIZED.store(true, Ordering::SeqCst);
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            work.left,
+            work.top,
+            work.right - work.left,
+            work.bottom - work.top,
+            SWP_SHOWWINDOW,
+        )
+    };
+}
+
+#[cfg(windows)]
+fn show(cmd: windows_sys::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD) {
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow;
+
+    let hwnd = unsafe { GetConsoleWindow() };
+    if !hwnd.is_null() {
+        unsafe { ShowWindow(hwnd, cmd) };
+    }
+}
+
+#[cfg(not(windows))]
+pub fn minimize() {}
+
+#[cfg(not(windows))]
+pub fn toggle_maximize() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +262,14 @@ mod tests {
         // Under `cargo test` the harness owns the console, so this is false;
         // only the call itself is under test.
         let _ = owns_console_alone();
+    }
+
+    #[test]
+    fn the_window_controls_are_safe_without_a_console_window() {
+        // Same path a terminal that owns no window takes.
+        minimize();
+        toggle_maximize();
+        toggle_maximize();
     }
 
     #[test]

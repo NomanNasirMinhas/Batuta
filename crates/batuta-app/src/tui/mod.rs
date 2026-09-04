@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -47,6 +47,8 @@ use crate::pipe::PipeStream;
 use crate::tui::app::{Exit, PendingDiscard};
 use crate::tui::explorer::state::{Action, Explorer, Focus};
 use crate::tui::explorer::tree::Disk;
+use crate::tui::terminal::keys as termkeys;
+use crate::tui::terminal::session::Session;
 use crate::{query, scan};
 
 /// Where answers come from.
@@ -241,6 +243,28 @@ fn event_loop<B: Backend>(
             visible = ui::draw(f, app);
         })?;
 
+        // Keep the shell's idea of its size matching the pane it is drawn
+        // in, and take whatever it has produced. Both every frame: a terminal
+        // that only updated on a keystroke would look frozen while a build
+        // runs.
+        if app.mode == Mode::Terminal {
+            if let Ok(size) = terminal.size() {
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width: size.width,
+                    height: size.height,
+                };
+                let screen = layout::terminal(area).screen;
+                if let Some(t) = app.terminal.as_mut() {
+                    if t.grid.size() != (screen.width as usize, screen.height as usize) {
+                        t.resize(screen.width, screen.height);
+                    }
+                    t.pump();
+                }
+            }
+        }
+
         // A resize changes how many rows fit, but the fetch that ran before it
         // asked for the old count. Left alone, a window that just got taller
         // keeps showing the shorter list against a screenful of blank rows —
@@ -283,8 +307,29 @@ fn event_loop<B: Backend>(
                         pending = true;
                     }
                     Event::Mouse(m) => match m.kind {
-                        MouseEventKind::ScrollDown => app.move_selection(3, visible),
-                        MouseEventKind::ScrollUp => app.move_selection(-3, visible),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Ok(size) = terminal.size() {
+                                window_button(app, m.column, m.row, size.width, size.height);
+                            }
+                        }
+                        // In the terminal the wheel walks the shell's history
+                        // rather than a result list.
+                        MouseEventKind::ScrollDown => match app.mode {
+                            Mode::Terminal => {
+                                if let Some(t) = app.terminal.as_mut() {
+                                    t.grid.scroll_view(3);
+                                }
+                            }
+                            _ => app.move_selection(3, visible),
+                        },
+                        MouseEventKind::ScrollUp => match app.mode {
+                            Mode::Terminal => {
+                                if let Some(t) = app.terminal.as_mut() {
+                                    t.grid.scroll_view(-3);
+                                }
+                            }
+                            _ => app.move_selection(-3, visible),
+                        },
                         _ => {}
                     },
                     Event::Resize(_, _) => pending = true,
@@ -339,6 +384,11 @@ fn refresh(app: &mut App, backend: &mut Source, visible: usize, dupe_job: &mut O
     // must stay free to switch modes, scroll and quit while it works. Every
     // other refresh in the mode — scrolling, re-entering it — is served by
     // moving the window over the cache.
+    if app.mode == Mode::Terminal {
+        app.dirty = false;
+        return;
+    }
+
     // The explorer reads the disk, not the index, so there is nothing to ask
     // for here beyond re-flattening the tree for the next frame.
     if app.mode == Mode::Explore {
@@ -542,6 +592,125 @@ fn shell_open(path: &std::path::Path) -> bool {
     rc > SHELL_SUCCESS
 }
 
+/// Act on a click in the custom title bar.
+///
+/// Only the views that draw one respond: a click at the top of the search
+/// results is a click on results, not on a control that is not there.
+fn window_button(app: &mut App, col: u16, row: u16, width: u16, height: u16) {
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let bar = match app.mode {
+        Mode::Terminal => layout::terminal(area).title,
+        Mode::Explore => layout::explorer(area, true).title,
+        _ => return,
+    };
+
+    match layout::title_button_at(bar, col, row) {
+        Some(layout::TitleButton::Minimize) => crate::console::minimize(),
+        Some(layout::TitleButton::Maximize) => crate::console::toggle_maximize(),
+        // The only place a click is allowed to end the program.
+        Some(layout::TitleButton::Close) => app.quit = true,
+        None => {}
+    }
+}
+
+/// The folder a terminal should open in: the highlighted one, or the folder
+/// holding the highlighted file.
+fn terminal_cwd(app: &App) -> std::path::PathBuf {
+    // The explorer's selection wins when it is on screen, because that is
+    // what the user is looking at.
+    if let Some(x) = &app.explorer {
+        if let Some(row) = x.selected_row() {
+            return if row.is_dir {
+                row.path.clone()
+            } else {
+                row.path
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(home_dir)
+            };
+        }
+        return x.tree.root().to_path_buf();
+    }
+    match app.current().map(|r| std::path::PathBuf::from(&r.path)) {
+        Some(p) if p.is_dir() => p,
+        Some(p) => p
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(home_dir),
+        None => home_dir(),
+    }
+}
+
+/// Open a shell, remembering where to go back to.
+fn enter_terminal(app: &mut App, cols: u16, rows: u16) {
+    let cwd = terminal_cwd(app);
+    match Session::open(&cwd, cols, rows) {
+        Ok(session) => {
+            app.came_from = Some(app.mode);
+            app.terminal = Some(session);
+            app.mode = Mode::Terminal;
+            app.status.clear();
+        }
+        Err(e) => app.status = format!("could not open a shell: {e}"),
+    }
+}
+
+/// Leave the terminal, ending the shell with it.
+fn leave_terminal(app: &mut App) {
+    // Dropped rather than kept alive in the background: a shell nobody can
+    // see, still holding a directory open, is a surprise later.
+    app.terminal = None;
+    app.mode = app.came_from.take().unwrap_or(Mode::Search);
+    app.dirty = true;
+    app.status.clear();
+}
+
+/// Route one key through the terminal.
+///
+/// Almost everything belongs to the program running inside it — including
+/// `Ctrl+C`, which is an interrupt there and nothing else, and `Esc`, which is
+/// how anyone leaves insert mode. Only two keys are kept back.
+fn terminal_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    match key.code {
+        KeyCode::Char('q' | 'Q') if ctrl => {
+            app.quit = true;
+            return;
+        }
+        KeyCode::Char('e' | 'E') if ctrl => {
+            leave_terminal(app);
+            return;
+        }
+        // Scrolling the history is the terminal's own, not the shell's.
+        KeyCode::PageUp if shift => {
+            if let Some(t) = &mut app.terminal {
+                t.grid.scroll_view(-10);
+            }
+            return;
+        }
+        KeyCode::PageDown if shift => {
+            if let Some(t) = &mut app.terminal {
+                t.grid.scroll_view(10);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    if let Some(bytes) = termkeys::encode(key) {
+        if let Some(t) = &mut app.terminal {
+            t.send(&bytes);
+        }
+    }
+}
+
 /// Route one key through the explorer.
 fn explorer_key(app: &mut App, key: KeyEvent, visible: usize) {
     // The escape hatch for a file the editor will not open. Handled here
@@ -579,6 +748,7 @@ fn explorer_key(app: &mut App, key: KeyEvent, visible: usize) {
             }
         }
         Action::Leave => leave_explorer(app),
+        Action::OpenTerminal => enter_terminal(app, 80, 24),
         Action::Quit => {
             if !guard_unsaved(app, Exit::Quit) {
                 app.quit = true;
@@ -646,6 +816,10 @@ fn handle_key(app: &mut App, key: KeyEvent, visible: usize) {
         explorer_key(app, key, visible);
         return;
     }
+    if app.mode == Mode::Terminal {
+        terminal_key(app, key);
+        return;
+    }
 
     match key.code {
         // Ctrl arms must come before the plain-character arm below, or
@@ -655,7 +829,11 @@ fn handle_key(app: &mut App, key: KeyEvent, visible: usize) {
         // is concerned: with it on, Ctrl+S arrives as `Char('S')` and matching
         // only lowercase silently does nothing. Shift+Ctrl+S lands here too,
         // which is what anyone pressing it would expect.
-        KeyCode::Char('c' | 'C') if ctrl => app.quit = true,
+        // Ctrl+C opens a shell now; Ctrl+Q is what quits. Inside the
+        // terminal Ctrl+C reverts to its real meaning, interrupting whatever
+        // is running, which is the one binding it would be perverse to take.
+        KeyCode::Char('c' | 'C') if ctrl => enter_terminal(app, 80, 24),
+        KeyCode::Char('q' | 'Q') if ctrl => app.quit = true,
         KeyCode::Char('u' | 'U') if ctrl => app.clear_query(),
         KeyCode::Char('w' | 'W') if ctrl => app.delete_word(),
         KeyCode::Char('s' | 'S') if ctrl => app.cycle_sort(),
@@ -1043,10 +1221,10 @@ mod tests {
         let mut app = App::default();
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::CONTROL),
             10,
         );
-        assert!(app.quit, "Ctrl+Shift+C must still quit");
+        assert!(app.quit, "Ctrl+Shift+Q must still quit");
     }
 
     #[test]
@@ -1236,10 +1414,19 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_still_quits() {
+    fn ctrl_q_quits_and_ctrl_c_does_not() {
+        // Ctrl+C had to move: inside a terminal it means "interrupt what is
+        // running", and that is not a binding worth taking from someone.
+        let mut app = App::default();
+        ctrl(&mut app, 'q');
+        assert!(app.quit, "Ctrl+Q is what ends the program now");
+
         let mut app = App::default();
         ctrl(&mut app, 'c');
-        assert!(app.quit);
+        assert!(
+            !app.quit,
+            "Ctrl+C must never quit again - it opens a shell instead"
+        );
     }
 
     #[test]

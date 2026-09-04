@@ -19,6 +19,11 @@ pub enum Mode {
     /// cache the user refreshes with F5, because a scan reads file contents
     /// and takes seconds, not microseconds.
     Dupes,
+    /// A shell, running in a pseudo-console.
+    ///
+    /// Outside the cycle for the same reasons as the explorer, and one more:
+    /// almost every key belongs to the program running inside it.
+    Terminal,
     /// Directory tree, path bar and text editor.
     ///
     /// Deliberately outside the `Shift+Tab` cycle below: cycling into an
@@ -35,7 +40,7 @@ impl Mode {
             Mode::Bloat => Mode::Dupes,
             Mode::Dupes => Mode::Search,
             // Never reached by the cycle; defined so the function stays total.
-            Mode::Explore => Mode::Search,
+            Mode::Explore | Mode::Terminal => Mode::Search,
         }
     }
 }
@@ -191,6 +196,12 @@ pub struct App {
     /// The explorer, built the first time it is opened.
     pub explorer: Option<crate::tui::explorer::state::Explorer>,
 
+    /// The running shell, if one has been opened.
+    pub terminal: Option<crate::tui::terminal::session::Session>,
+
+    /// Where `Esc` came from, so leaving unwinds one step at a time.
+    pub came_from: Option<Mode>,
+
     /// A pending "you have unsaved changes" prompt.
     ///
     /// Kept separate from `confirm_delete` rather than folded into one modal
@@ -216,6 +227,8 @@ impl Default for App {
             rail: true,
             pending_file: None,
             explorer: None,
+            terminal: None,
+            came_from: None,
             confirm_discard: None,
             rows: Vec::new(),
             window_start: 0,
@@ -563,9 +576,10 @@ impl App {
             // A dupes scan is far too expensive to repeat per scroll, so the
             // result is fetched whole, held, and windowed locally. Only a
             // pending scan issues this request at all.
-            // The explorer reads the disk directly and never queries the
-            // index; `refresh` returns before this is reached.
-            Mode::Explore => Request::Status,
+            // Neither of these queries the index - one reads the disk, the
+            // other a pseudo-console - and `refresh` returns before this is
+            // reached for both.
+            Mode::Explore | Mode::Terminal => Request::Status,
             Mode::Dupes => Request::Dupes {
                 min_size: DUPES_MIN_SIZE,
                 top: DUPES_TOP,

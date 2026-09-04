@@ -67,6 +67,8 @@ pub enum Action {
     /// Load this file, discarding whatever is open.
     Open(PathBuf),
     Save,
+    /// Open a shell in the highlighted folder.
+    OpenTerminal,
     /// Complete the path bar. Handled by the caller because it needs a
     /// directory listing, which is the caller's to supply.
     Complete,
@@ -206,9 +208,15 @@ impl Explorer {
             // Both cases: Caps Lock makes these arrive uppercase, and a
             // shortcut that quietly stops working is worse than one that
             // never existed.
-            KeyCode::Char('c' | 'C') if ctrl => return Action::Quit,
+            // Ctrl+C opens a terminal here rather than quitting; Ctrl+Q is
+            // what ends the program now.
+            KeyCode::Char('c' | 'C') if ctrl => return Action::OpenTerminal,
+            KeyCode::Char('q' | 'Q') if ctrl => return Action::Quit,
             KeyCode::Char('s' | 'S') if ctrl => return Action::Save,
-            KeyCode::Esc => return Action::Leave,
+            // The way out is the key that came in. Esc used to leave, which
+            // made it far too easy to lose an editor by reflex.
+            KeyCode::Char('e' | 'E') if ctrl => return Action::Leave,
+            KeyCode::Esc => return Action::None,
             KeyCode::F(5) => {
                 self.tree.refresh();
                 return Action::None;
@@ -761,11 +769,34 @@ mod tests {
     }
 
     #[test]
-    fn esc_asks_to_leave_rather_than_quitting_outright() {
-        // Outside the explorer this key exits the program.
+    fn esc_does_nothing_here() {
+        // Outside the explorer this key exits the program. Inside, reflexively
+        // pressing it must not throw away an open editor.
         let fs = Fake::new(&[]);
         let mut x = with_doc();
-        assert_eq!(x.key(key(KeyCode::Esc), 10, &fs), Action::Leave);
+        assert_eq!(x.key(key(KeyCode::Esc), 10, &fs), Action::None);
+    }
+
+    #[test]
+    fn the_key_that_came_in_is_the_key_that_leaves() {
+        let fs = Fake::new(&[]);
+        let mut x = with_doc();
+        assert_eq!(
+            x.key(ctrl(KeyCode::Char('e')), 10, &fs),
+            Action::Leave,
+            "Ctrl+E toggles back out"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_opens_a_terminal_and_ctrl_q_is_what_quits() {
+        let fs = Fake::new(&[]);
+        let mut x = with_doc();
+        assert_eq!(
+            x.key(ctrl(KeyCode::Char('c')), 10, &fs),
+            Action::OpenTerminal
+        );
+        assert_eq!(x.key(ctrl(KeyCode::Char('q')), 10, &fs), Action::Quit);
     }
 
     #[test]

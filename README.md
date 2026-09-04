@@ -87,6 +87,8 @@ go.
 | `Ctrl+B` | show or hide the rail |
 | `Ctrl+D` | jump straight to duplicates (and back) |
 | `Ctrl+E` | open the explorer on the highlighted entry |
+| `Ctrl+C` | open a shell in the highlighted folder |
+| `Ctrl+Q` | quit |
 | `Enter` | reveal the selected entry in Explorer, and close |
 | `Shift+Enter` | open it: a folder in Explorer, a file in its own application |
 | `Ctrl+W` / `Ctrl+U` | delete a word / clear the query without closing |
@@ -221,6 +223,34 @@ away.
 
 Not yet done: find-in-file, and syntax highlighting and formatters are out of
 scope by choice.
+
+`Ctrl+C` opens a **terminal** in the highlighted folder, or the folder holding
+the highlighted file. It is a real terminal — a pseudo-console with a VT
+interpreter behind it — not a box that runs a command and prints the output. So
+`git`, `cargo` and `npm` work, and so do the full-screen programs: colours,
+cursor movement, scroll regions and the alternate screen are all handled.
+
+That choice answers three things by not doing them. Tab completion in the
+terminal is **PowerShell's**, and intercepting Tab would break it. Command
+history is PowerShell's too — `Up` already works. And `Esc` is forwarded rather
+than swallowed, because that is how anyone leaves insert mode in `vim`.
+
+`Ctrl+C` had to move for this. Inside a terminal it means *interrupt what is
+running*, which is the one binding it would be perverse to take from someone,
+so **quitting is `Ctrl+Q`** now. Inside the terminal only `Ctrl+Q` and `Ctrl+E`
+are held back; everything else goes to the shell. `Shift+PageUp` and the mouse
+wheel scroll the history.
+
+`Esc` no longer closes anything in the explorer or the terminal. Reflexively
+pressing it should not throw away an open editor, so the key that opened a view
+is the key that leaves it.
+
+Both views draw a **title bar** with minimise, maximise and close. That is not
+decoration: the launcher window is deliberately borderless, which took the real
+title bar away with the frame, and without these there is no way to get the
+window out of the way short of ending the program. The buttons act on the
+actual window, and the hit boxes are computed by the same function that decides
+where to draw them, so the two cannot drift apart.
 
 Color carries the reading order rather than decorating. Each mode has its
 own accent that tints the border, the title, the mode pills in the top
@@ -502,7 +532,7 @@ precisely which parts did not happen.
 cargo test --workspace
 ```
 
-482 tests, none of which require elevation. The MFT parser is exercised against
+537 tests, none of which require elevation. The MFT parser is exercised against
 hand-built records covering update-sequence fixups, resident and non-resident
 `$DATA`, fragmented run lists, `$ATTRIBUTE_LIST` spill of both sizes *and*
 names, hard links, DOS 8.3 aliases, alternate data streams, and deliberately

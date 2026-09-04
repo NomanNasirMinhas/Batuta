@@ -99,6 +99,8 @@ const PATH_BARE: u16 = 1;
 /// Where the explorer's panes go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExplorerPanes {
+    /// The custom title bar, carrying the window controls.
+    pub title: Rect,
     /// The directory tree, or `None` when the terminal is too narrow.
     pub tree: Option<Rect>,
     pub editor: Rect,
@@ -119,12 +121,13 @@ pub fn explorer(area: Rect, tree_wanted: bool) -> ExplorerPanes {
     // whole terminal, because a path is the longest string on screen and the
     // one that suffers most from being boxed in.
     let rows = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Min(0),
         Constraint::Length(path_h),
         Constraint::Length(1),
     ])
     .split(area);
-    let (main, path, status) = (rows[0], rows[1], rows[2]);
+    let (title, main, path, status) = (rows[0], rows[1], rows[2], rows[3]);
 
     let (tree, editor) = if tree_wanted && area.width >= TREE_MIN_COLS {
         let cols =
@@ -135,11 +138,75 @@ pub fn explorer(area: Rect, tree_wanted: bool) -> ExplorerPanes {
     };
 
     ExplorerPanes {
+        title,
         tree,
         editor,
         path,
         status,
         compact,
+    }
+}
+
+/// A control on the custom title bar.
+///
+/// The hotkey window is deliberately borderless, which took the real title bar
+/// with it. These put back the three things it was for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleButton {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+/// Columns each button occupies, and how many there are.
+const BUTTON_WIDTH: u16 = 5;
+const BUTTONS: u16 = 3;
+
+/// Which button, if any, sits under a click.
+///
+/// Pure arithmetic so the hit boxes can be tested without a mouse: an
+/// off-by-one here means closing the window when you meant to minimise it,
+/// which is not a mistake worth discovering by hand.
+pub fn title_button_at(bar: Rect, x: u16, y: u16) -> Option<TitleButton> {
+    if y != bar.y || bar.width < BUTTON_WIDTH * BUTTONS {
+        return None;
+    }
+    let first = bar.x + bar.width - BUTTON_WIDTH * BUTTONS;
+    if x < first {
+        return None;
+    }
+    match (x - first) / BUTTON_WIDTH {
+        0 => Some(TitleButton::Minimize),
+        1 => Some(TitleButton::Maximize),
+        _ => Some(TitleButton::Close),
+    }
+}
+
+/// Where the buttons start, for drawing them in the same place they are
+/// clicked. Sharing this is what stops the two drifting apart.
+pub fn title_buttons_origin(bar: Rect) -> u16 {
+    bar.x + bar.width.saturating_sub(BUTTON_WIDTH * BUTTONS)
+}
+
+/// Panes for the terminal view: a title bar, the screen, and a status line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalPanes {
+    pub title: Rect,
+    pub screen: Rect,
+    pub status: Rect,
+}
+
+pub fn terminal(area: Rect) -> TerminalPanes {
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    TerminalPanes {
+        title: rows[0],
+        screen: rows[1],
+        status: rows[2],
     }
 }
 
@@ -215,7 +282,12 @@ mod tests {
         for (w, h) in [(140, 40), (89, 40), (140, 12), (60, 8), (200, 60)] {
             let a = area(w, h);
             let p = explorer(a, true);
-            let mut all = vec![("editor", p.editor), ("path", p.path), ("status", p.status)];
+            let mut all = vec![
+                ("title", p.title),
+                ("editor", p.editor),
+                ("path", p.path),
+                ("status", p.status),
+            ];
             if let Some(t) = p.tree {
                 all.push(("tree", t));
             }
@@ -240,7 +312,68 @@ mod tests {
         for (w, h) in [(1, 1), (2, 2), (10, 3), (200, 1)] {
             let a = area(w, h);
             let p = explorer(a, true);
-            for r in [p.editor, p.path, p.status] {
+            for r in [p.title, p.editor, p.path, p.status] {
+                assert!(
+                    r.x + r.width <= a.x + a.width && r.y + r.height <= a.y + a.height,
+                    "{r:?} escapes {a:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_title_buttons_are_where_they_are_drawn() {
+        let bar = area(80, 1);
+        // Rightmost is close, then maximise, then minimise.
+        assert_eq!(title_button_at(bar, 79, 0), Some(TitleButton::Close));
+        assert_eq!(title_button_at(bar, 75, 0), Some(TitleButton::Close));
+        assert_eq!(title_button_at(bar, 74, 0), Some(TitleButton::Maximize));
+        assert_eq!(title_button_at(bar, 70, 0), Some(TitleButton::Maximize));
+        assert_eq!(title_button_at(bar, 69, 0), Some(TitleButton::Minimize));
+        assert_eq!(title_button_at(bar, 65, 0), Some(TitleButton::Minimize));
+
+        // The title itself is not a button.
+        assert_eq!(title_button_at(bar, 64, 0), None);
+        assert_eq!(title_button_at(bar, 0, 0), None);
+        assert_eq!(title_buttons_origin(bar), 65);
+    }
+
+    #[test]
+    fn a_click_off_the_title_row_is_not_a_button() {
+        // Otherwise clicking the first line of output would close the window.
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 1,
+        };
+        assert_eq!(title_button_at(bar, 79, 1), None);
+        assert_eq!(title_button_at(bar, 79, 5), None);
+    }
+
+    #[test]
+    fn a_bar_too_narrow_for_buttons_has_none() {
+        // Better nothing than three overlapping hit boxes, one of which
+        // closes the window.
+        assert_eq!(title_button_at(area(10, 1), 9, 0), None);
+    }
+
+    #[test]
+    fn the_terminal_view_gives_the_screen_everything_left_over() {
+        let a = area(100, 30);
+        let p = terminal(a);
+        assert_eq!(p.title.height, 1);
+        assert_eq!(p.status.height, 1);
+        assert_eq!(p.screen.height, 28);
+        assert_eq!(p.screen.width, 100);
+    }
+
+    #[test]
+    fn a_terminal_view_in_a_tiny_area_still_produces_valid_panes() {
+        for (w, h) in [(1, 1), (2, 2), (80, 1), (80, 2)] {
+            let a = area(w, h);
+            let p = terminal(a);
+            for r in [p.title, p.screen, p.status] {
                 assert!(
                     r.x + r.width <= a.x + a.width && r.y + r.height <= a.y + a.height,
                     "{r:?} escapes {a:?}"

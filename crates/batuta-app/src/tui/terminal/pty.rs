@@ -111,8 +111,12 @@ impl Pty {
             pixel_height: 0,
         });
     }
+}
 
-    /// Whether the shell is still running.
+/// Only the startup test asks this: everything else learns the shell has gone
+/// from the output stream closing, which is the same fact arriving earlier.
+#[cfg(test)]
+impl Pty {
     pub fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }

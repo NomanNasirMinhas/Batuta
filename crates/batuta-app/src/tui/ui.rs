@@ -91,6 +91,9 @@ pub fn draw(f: &mut Frame, app: &App) -> usize {
     if app.mode == Mode::Explore {
         return draw_explorer(f, app);
     }
+    if app.mode == Mode::Terminal {
+        return draw_terminal(f, app);
+    }
 
     let panes = layout::compute(f.area(), app.rail);
 
@@ -129,6 +132,12 @@ fn draw_explorer(f: &mut Frame, app: &App) -> usize {
     let Some(x) = &app.explorer else {
         return 0;
     };
+
+    let title = x
+        .open_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| x.tree.root().display().to_string());
+    draw_title_bar(f, panes.title, &title, accent);
 
     if let Some(area) = panes.tree {
         draw_tree(f, area, x, accent);
@@ -432,6 +441,181 @@ fn draw_discard_confirm(f: &mut Frame, area: Rect, pending: &PendingDiscard) {
     );
 }
 
+/// The title bar the borderless window no longer has.
+///
+/// Making the launcher window frameless took away minimise, maximise and
+/// close along with the frame. Drawing them back is not decoration: without a
+/// title bar there is otherwise no way to get the window out of the way
+/// without ending the program.
+fn draw_title_bar(f: &mut Frame, area: Rect, title: &str, accent: Color) {
+    let base = Style::default().fg(theme().on_accent()).bg(accent);
+    f.render_widget(Block::default().style(base), area);
+
+    let left = format!(" {title}");
+    f.render_widget(
+        Paragraph::new(Span::styled(left, base.add_modifier(Modifier::BOLD))),
+        area,
+    );
+
+    // Drawn from the same origin the click test uses, so what is pressed is
+    // always what was drawn.
+    let origin = layout::title_buttons_origin(area);
+    if origin > area.x {
+        let buttons = Rect {
+            x: origin,
+            y: area.y,
+            width: area.width - (origin - area.x),
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled("  \u{2500}    \u{25a1}    \u{2715}  ", base)),
+            buttons,
+        );
+    }
+}
+
+/// Map a terminal colour onto ratatui's, honouring the theme's palette.
+fn ink(c: crate::tui::terminal::grid::Ink, fallback: Color) -> Color {
+    use crate::tui::terminal::grid::Ink;
+    match c {
+        Ink::Default => fallback,
+        Ink::Indexed(i) => Color::Indexed(i),
+        Ink::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+fn draw_terminal(f: &mut Frame, app: &App) -> usize {
+    let panes = layout::terminal(f.area());
+    f.render_widget(Block::default().style(base_style()), f.area());
+
+    let accent = mode_accent(Mode::Terminal);
+    let Some(term) = &app.terminal else {
+        return 0;
+    };
+
+    // The shell's own title when it says something, the folder otherwise.
+    // PowerShell's default title is the full path to `powershell.exe`, which
+    // is the least useful string available and would sit there permanently.
+    let title = match term.title() {
+        Some(t) if !t.to_ascii_lowercase().ends_with(".exe") => t.to_string(),
+        _ => term.cwd.display().to_string(),
+    };
+    draw_title_bar(f, panes.title, &title, accent);
+
+    // The grid is already a screen: every cell carries its own colour, so
+    // this is a transcription rather than a layout.
+    let lines: Vec<Line> = term
+        .grid
+        .visible()
+        .iter()
+        .take(panes.screen.height as usize)
+        .map(|row| {
+            let mut spans: Vec<Span> = Vec::new();
+            let mut run = String::new();
+            let mut style: Option<crate::tui::terminal::grid::Style> = None;
+
+            // Cells are merged into runs of the same style: a span per cell
+            // would be tens of thousands of allocations per frame.
+            for cell in row.iter().take(panes.screen.width as usize) {
+                if style != Some(cell.style) {
+                    if let Some(prev) = style {
+                        spans.push(Span::styled(std::mem::take(&mut run), to_style(prev)));
+                    }
+                    style = Some(cell.style);
+                }
+                run.push(cell.ch);
+            }
+            if let Some(last) = style {
+                spans.push(Span::styled(run, to_style(last)));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines), panes.screen);
+
+    // The real caret, positioned where the program put it.
+    if term.grid.cursor_visible && term.grid.view_offset == 0 {
+        let (row, col) = term.grid.cursor();
+        if (row as u16) < panes.screen.height && (col as u16) < panes.screen.width {
+            f.set_cursor_position((panes.screen.x + col as u16, panes.screen.y + row as u16));
+        }
+    }
+
+    draw_terminal_status(f, panes.status, app, term);
+    panes.screen.height as usize
+}
+
+fn to_style(s: crate::tui::terminal::grid::Style) -> Style {
+    let mut out = Style::default()
+        .fg(ink(s.fg, theme().text()))
+        .bg(ink(s.bg, theme().bg().unwrap_or(Color::Reset)));
+    if s.bold {
+        out = out.add_modifier(Modifier::BOLD);
+    }
+    if s.dim {
+        out = out.add_modifier(Modifier::DIM);
+    }
+    if s.italic {
+        out = out.add_modifier(Modifier::ITALIC);
+    }
+    if s.underline {
+        out = out.add_modifier(Modifier::UNDERLINED);
+    }
+    if s.reverse {
+        out = out.add_modifier(Modifier::REVERSED);
+    }
+    out
+}
+
+fn draw_terminal_status(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    term: &crate::tui::terminal::session::Session,
+) {
+    let mut left = Vec::new();
+    if !app.status.is_empty() {
+        left.push(Span::styled(
+            app.status.clone(),
+            Style::default().fg(theme().warn()),
+        ));
+    } else if term.ended {
+        // Otherwise a dead shell just looks like a frozen one.
+        left.push(Span::styled(
+            "the shell has exited - Esc to leave",
+            Style::default().fg(theme().warn()),
+        ));
+    } else {
+        left.push(Span::styled(
+            term.cwd.display().to_string(),
+            Style::default().fg(dim()),
+        ));
+        if term.grid.view_offset > 0 {
+            left.push(Span::styled(
+                format!(
+                    "  ·  scrolled back {} of {}",
+                    term.grid.view_offset,
+                    term.grid.scrollback_len()
+                ),
+                Style::default().fg(theme().warn()),
+            ));
+        }
+    }
+
+    let keys = "keys go to the shell  ·  Ctrl+E explorer  ·  Ctrl+Q quit";
+    let chunks = Layout::horizontal([
+        Constraint::Min(10),
+        Constraint::Length(keys.chars().count() as u16 + 1),
+    ])
+    .split(area);
+    f.render_widget(Paragraph::new(Line::from(left)), chunks[0]);
+    f.render_widget(
+        Paragraph::new(Span::styled(keys, Style::default().fg(dim()))).alignment(Alignment::Right),
+        chunks[1],
+    );
+}
+
 /// Centre a box of the given size inside `area`.
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let w = width.min(area.width.saturating_sub(2));
@@ -630,6 +814,7 @@ fn draw_query(f: &mut Frame, area: Rect, app: &App, panes: &Panes) {
         Mode::Bloat => " batuta · bloat (largest directories) ",
         Mode::Dupes => " batuta · duplicates (byte-identical files) ",
         Mode::Explore => " batuta · explore ",
+        Mode::Terminal => " batuta · terminal ",
     };
 
     let prompt = match app.mode {
@@ -642,7 +827,7 @@ fn draw_query(f: &mut Frame, area: Rect, app: &App, panes: &Panes) {
             "each file with the paths holding identical copies — F5 rescan, Shift+Tab modes",
             Style::default().fg(dim()),
         )]),
-        Mode::Explore => Line::from(Span::raw("")),
+        Mode::Explore | Mode::Terminal => Line::from(Span::raw("")),
     };
 
     // A short terminal cannot afford two rows of frame around one row of
@@ -755,7 +940,7 @@ fn draw_results(f: &mut Frame, area: Rect, app: &App) -> usize {
             ),
             // Never drawn: `draw` sends Explore to its own screen. Present
             // so the match stays total.
-            Mode::Explore | Mode::Dupes => (
+            Mode::Explore | Mode::Terminal | Mode::Dupes => (
                 vec!["SIZE", "COPIES", "PATH"],
                 vec![
                     Constraint::Length(10),
@@ -1305,6 +1490,20 @@ mod tests {
             explorer: Some(x),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_title_bar_carries_the_window_controls() {
+        // The launcher window is borderless, so these are the only way to
+        // minimise or close it without ending the program from the keyboard.
+        let app = explorer_fixture();
+        let (screen, _) = render(&app, 100, 20);
+        let bar = screen.lines().next().expect("a title row");
+
+        assert!(bar.contains('\u{2500}'), "minimise missing: {bar}");
+        assert!(bar.contains('\u{25a1}'), "maximise missing: {bar}");
+        assert!(bar.contains('\u{2715}'), "close missing: {bar}");
+        assert!(bar.contains("main.rs"), "the title itself is missing");
     }
 
     #[test]
