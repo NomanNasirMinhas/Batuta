@@ -542,44 +542,85 @@ fn path_spans(
         return vec![Span::styled(path.to_owned(), base)];
     }
 
-    let (p, n) = (path.as_bytes(), needle.as_bytes());
-    // A needle longer than the path cannot match, and must not be searched
-    // for. `saturating_sub` collapsed that case to the range `0..=0`, which
-    // then sliced `p[0..n.len()]` straight past the end of the path — the
-    // guard below it ran on the result of `find`, far too late to prevent it.
-    //
-    // This is not a corner case: while browsing a path the rows are matched
-    // by directory, and the needle is only the segment being typed, so a row
-    // whose whole path is shorter than what has been typed is ordinary.
-    let at = if n.is_empty() || n.len() > p.len() {
-        None
-    } else {
-        (0..=p.len() - n.len()).find(|&i| p[i..i + n.len()].eq_ignore_ascii_case(n))
-    };
-    // ASCII comparison cannot land inside a multi-byte character, but slicing
-    // is the one place a bug here would panic, so stay defensive.
-    let split = at.and_then(|i| {
-        match (
-            path.get(..i),
-            path.get(i..i + n.len()),
-            path.get(i + n.len()..),
-        ) {
-            (Some(a), Some(m), Some(z)) => Some((a, m, z)),
-            _ => None,
-        }
-    });
+    let highlighted = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+    let plain = || vec![Span::styled(path.to_owned(), base)];
 
-    match split {
-        Some((a, m, z)) => vec![
-            Span::styled(a.to_owned(), base),
-            Span::styled(
-                m.to_owned(),
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(z.to_owned(), base),
-        ],
-        None => vec![Span::styled(path.to_owned(), base)],
+    // Every occurrence of every term. A query of several terms matches across
+    // the whole path rather than any one name, so picking out only the first
+    // hit would leave most of the reason a row matched invisible.
+    let mut ranges = occurrences(path.as_bytes(), needle);
+    if ranges.is_empty() {
+        return plain();
     }
+    ranges.sort_unstable();
+
+    // Terms overlap freely: one can sit inside another's hit, and two can
+    // share a prefix. Merging first leaves the spans ordered and disjoint,
+    // which is what rendering them requires.
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+
+    // ASCII comparison cannot land inside a multi-byte character, but slicing
+    // is the one place a bug here would panic. If a boundary is not a
+    // character boundary the whole path is drawn unhighlighted rather than
+    // dropping the piece that failed: losing text from a path is a worse
+    // outcome than losing its emphasis.
+    let mut spans = Vec::with_capacity(merged.len() * 2 + 1);
+    let mut cursor = 0usize;
+    for (start, end) in merged {
+        let (Some(before), Some(hit)) = (path.get(cursor..start), path.get(start..end)) else {
+            return plain();
+        };
+        if !before.is_empty() {
+            spans.push(Span::styled(before.to_owned(), base));
+        }
+        spans.push(Span::styled(hit.to_owned(), highlighted));
+        cursor = end;
+    }
+    match path.get(cursor..) {
+        Some(rest) => {
+            if !rest.is_empty() {
+                spans.push(Span::styled(rest.to_owned(), base));
+            }
+            spans
+        }
+        None => plain(),
+    }
+}
+
+/// Byte ranges where any term of `needle` appears in `path`, ignoring case.
+///
+/// Occurrences of a single term never overlap each other — a hit advances past
+/// itself — but different terms may, which the caller merges.
+fn occurrences(path: &[u8], needle: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    for term in needle.split_whitespace() {
+        let n = term.as_bytes();
+        // A term longer than the path cannot match, and must not be searched
+        // for: deriving the range with a saturating subtraction collapses it
+        // to `0..=0` and then reads `path[0..n.len()]` past the end. That was
+        // a real crash, and it is not a corner case — while browsing a path
+        // the rows are matched by directory, so a row shorter than what has
+        // been typed is ordinary.
+        if n.is_empty() || n.len() > path.len() {
+            continue;
+        }
+        let mut i = 0;
+        while i + n.len() <= path.len() {
+            if path[i..i + n.len()].eq_ignore_ascii_case(n) {
+                found.push((i, i + n.len()));
+                i += n.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    found
 }
 
 /// A bloat row: the rolled-up TOTAL in the size colors, OWN dim beside it, and
@@ -927,6 +968,67 @@ mod tests {
         assert!(marked.iter().any(|l| l.contains("BLOAT")), "{marked:?}");
         assert!(marked.iter().any(|l| l.contains("DIRS")), "{marked:?}");
         assert!(marked.iter().any(|l| l.contains("SIZE")), "{marked:?}");
+    }
+
+    #[test]
+    fn every_term_is_picked_out_not_just_the_first() {
+        // A multi-term query matches across the path, so showing only one hit
+        // would hide most of the reason the row is on screen.
+        let spans = path_spans(
+            r"D:\SSO Updates\a.zip",
+            "sso updates",
+            false,
+            Color::Cyan,
+            false,
+        );
+        let hits: Vec<String> = spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(hits, vec!["SSO", "Updates"]);
+    }
+
+    #[test]
+    fn a_term_is_picked_out_everywhere_it_appears() {
+        let spans = path_spans(r"D:\SSO\SSO 1.zip", "sso", false, Color::Cyan, false);
+        let hits = spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            .count();
+        assert_eq!(hits, 2, "both occurrences should be marked");
+    }
+
+    #[test]
+    fn overlapping_terms_merge_into_one_run() {
+        // "sso" sits inside "ssou". Rendered as two spans they would overlap
+        // and the text would be duplicated on screen.
+        let spans = path_spans("SSOU", "sso ssou", false, Color::Cyan, false);
+        let hits: Vec<String> = spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(hits, vec!["SSOU"]);
+    }
+
+    #[test]
+    fn the_spans_always_reassemble_into_the_original_path() {
+        // The invariant that matters more than any emphasis: however the row
+        // is split up, the user must still be shown their exact path.
+        for (path, needle) in [
+            (r"D:\SSO Updates\SSO 0.1.0.zip", "sso updates"),
+            (r"D:\SSO\SSO 1.zip", "sso"),
+            ("SSOU", "sso ssou"),
+            (r"C:\a\b.txt", "zzz"),
+            (r"C:\a\b.txt", ""),
+            (r"C:\a\b.txt", "   "),
+            (r"D:\x", "a-much-longer-needle-than-the-path"),
+        ] {
+            let spans = path_spans(path, needle, false, Color::Cyan, false);
+            let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(joined, path, "rebuilding failed for needle {needle:?}");
+        }
     }
 
     #[test]

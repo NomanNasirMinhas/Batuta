@@ -164,6 +164,108 @@ fn excluded_nodes_disappear_from_search() {
     assert_eq!(s.search(&idx, &q).nodes.len(), 1, "opt-in still finds them");
 }
 
+/// The shape from the bug report: a file whose name carries one term and
+/// whose directory carries the other.
+fn sso_tree() -> Index {
+    let mut t = TreeBuilder::new('D');
+    let downloads = t.dir(ROOT_REC, "Downloads");
+    let updates = t.dir(downloads, "SSO Updates");
+    t.file(updates, "SSO 0.1.0.zip", 15 * MB);
+    t.file(updates, "release notes.txt", 1024);
+    let other = t.dir(downloads, "Invoices");
+    t.file(other, "SSO 0.0.9.zip", 15 * MB);
+    t.build()
+}
+
+#[test]
+fn several_terms_match_across_the_whole_path() {
+    // "sso" alone finds the zips; "sso updates" found nothing, because no
+    // single *name* contains it — the directory carries half the query.
+    let idx = sso_tree();
+    let mut s = Searcher::new();
+
+    let one = s.search(&idx, &Query::new("sso"));
+    assert!(one.total >= 2, "the single term still works: {}", one.total);
+
+    s.reset();
+    let both = s.search(&idx, &Query::new("sso updates"));
+    let names = names_of(&idx, &both.nodes);
+    assert!(
+        names.contains(&"SSO 0.1.0.zip".to_string()),
+        "the file under SSO Updates must be found: {names:?}"
+    );
+    assert!(
+        !names.contains(&"SSO 0.0.9.zip".to_string()),
+        "the one under Invoices must not be: {names:?}"
+    );
+}
+
+#[test]
+fn a_term_may_be_carried_entirely_by_an_ancestor() {
+    // Neither term is in this file's own name; both are on its path.
+    let idx = sso_tree();
+    let mut s = Searcher::new();
+    let hits = s.search(&idx, &Query::new("sso notes"));
+    assert_eq!(
+        names_of(&idx, &hits.nodes),
+        vec!["release notes.txt"],
+        "a file inherits its directory's terms"
+    );
+}
+
+#[test]
+fn term_order_does_not_matter() {
+    let idx = sso_tree();
+    let mut a = Searcher::new();
+    let mut b = Searcher::new();
+    let forward = a.search(&idx, &Query::new("sso updates")).total;
+    let backward = b.search(&idx, &Query::new("updates sso")).total;
+    assert_eq!(forward, backward);
+    assert!(forward > 0);
+}
+
+#[test]
+fn every_term_has_to_match() {
+    let idx = sso_tree();
+    let mut s = Searcher::new();
+    assert_eq!(
+        s.search(&idx, &Query::new("sso nonexistent")).total,
+        0,
+        "one unmatched term must reject the whole query"
+    );
+}
+
+#[test]
+fn typing_a_second_term_does_not_narrow_away_ancestor_matches() {
+    // The subtle one. Typing "sso" then " notes" narrows from the previous
+    // result set, but "release notes.txt" was never in it: its own name has
+    // no "sso". Narrowing across that change would silently lose it.
+    let idx = sso_tree();
+    let mut s = Searcher::new();
+
+    s.search(&idx, &Query::new("sso"));
+    let after = s.search(&idx, &Query::new("sso notes"));
+    assert_eq!(
+        names_of(&idx, &after.nodes),
+        vec!["release notes.txt"],
+        "a fresh scan must replace the narrowed set"
+    );
+    assert!(!after.narrowed, "this transition cannot be a narrowing");
+}
+
+#[test]
+fn extra_whitespace_is_not_a_term() {
+    let idx = sso_tree();
+    let mut s = Searcher::new();
+    let plain = s.search(&idx, &Query::new("sso")).total;
+    s.reset();
+    let padded = s.search(&idx, &Query::new("  sso  ")).total;
+    assert_eq!(
+        plain, padded,
+        "padding must not turn this into a path query"
+    );
+}
+
 #[test]
 fn substring_search_is_case_insensitive_by_default() {
     let idx = sample_tree();

@@ -91,6 +91,24 @@ go.
 | `Ctrl+W` / `Ctrl+U` | delete a word / clear the query without closing |
 | `Esc` | close |
 
+Spaces are AND, matched against the whole path. `sso` searches names as it
+always did; `sso updates` finds `D:\Downloads\SSO Updates\SSO 0.1.0.zip`
+because one term is in the file's name and the other in a directory above it.
+No single *name* contains "sso updates", so a name-only search could never find
+that — yet it is the shape of most real searches, where you remember roughly
+where a thing lives as well as roughly what it is called. Term order does not
+matter, and every term has to match something on the path. Every occurrence
+of every term is picked out in the result, so the reason a row is on screen
+is visible rather than inferred.
+
+Testing every node's whole path directly would mean millions of ancestor walks
+per keystroke. Instead each term is scanned for once across the name arena —
+the same SIMD pass a one-word search uses — and those per-name hits are pushed
+down the tree in a single linear pass, so a node inherits every term its
+ancestors matched. That leaves a small candidate set for the authoritative walk
+to confirm. Typing a second word costs a few extra milliseconds, not a
+different order of magnitude.
+
 Typing a path browses it: `C:\` lists the root of the drive, `C:\Users\`
 lists that directory, and `C:\Users\Dev` filters the directory to names
 starting with `Dev`. If the path names no indexed directory, the last
@@ -404,7 +422,7 @@ precisely which parts did not happen.
 cargo test --workspace
 ```
 
-391 tests, none of which require elevation. The MFT parser is exercised against
+401 tests, none of which require elevation. The MFT parser is exercised against
 hand-built records covering update-sequence fixups, resident and non-resident
 `$DATA`, fragmented run lists, `$ATTRIBUTE_LIST` spill of both sizes *and*
 names, hard links, DOS 8.3 aliases, alternate data streams, and deliberately

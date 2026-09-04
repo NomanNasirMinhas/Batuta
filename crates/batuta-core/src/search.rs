@@ -19,6 +19,71 @@ use rayon::prelude::*;
 
 use crate::index::{flags, Index, NO_NODE};
 
+/// The whitespace-separated terms of a substring query.
+///
+/// One term is matched against names, as it always was. Several are ANDed
+/// against the *whole path*: `sso updates` finds
+/// `D:\Downloads\SSO Updates\SSO 0.1.0.zip` because one term matches the file
+/// and the other an ancestor directory. Matching names alone could never find
+/// that — no single name contains "sso updates" — yet it is the shape of most
+/// real searches, where you remember roughly where a thing lives as well as
+/// roughly what it is called.
+pub fn terms(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
+}
+
+/// Terms carried in the prefilter's bitmask. Beyond this the mask is a
+/// superset and the authoritative walk finishes the job.
+const MASK_TERMS: usize = 8;
+
+/// Does any name on this node's path contain every term?
+///
+/// The authoritative answer, and deliberately the only one: the fast pass
+/// below is a prefilter whose survivors all come back through here, so the two
+/// cannot drift apart into disagreeing about what matches.
+fn path_matches(idx: &Index, n: u32, terms: &[&str], case_sensitive: bool) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let all: u32 = if terms.len() >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << terms.len()) - 1
+    };
+    let mut got = 0u32;
+    let mut cur = n;
+
+    // A corrupt parent chain must not hang the UI; no real path is this deep.
+    for _ in 0..4096 {
+        let name = idx.name_bytes(cur);
+        for (i, t) in terms.iter().enumerate().take(32) {
+            if got & (1 << i) == 0 && name_contains(name, t.as_bytes(), case_sensitive) {
+                got |= 1 << i;
+            }
+        }
+        if got == all {
+            return true;
+        }
+        if idx.is_root(cur) {
+            return false;
+        }
+        let parent = idx.parent[cur as usize];
+        if parent == cur || parent as usize >= idx.len() {
+            return false;
+        }
+        cur = parent;
+    }
+    false
+}
+
+fn name_contains(name: &[u8], needle: &[u8], case_sensitive: bool) -> bool {
+    if case_sensitive {
+        memmem::find(name, needle).is_some()
+    } else {
+        contains_ascii_ci(name, needle)
+    }
+}
+
 /// How a query text is interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MatchMode {
@@ -121,6 +186,8 @@ pub struct Searcher {
     last_ordered: usize,
     /// Index generation the cached matches came from.
     last_generation: u64,
+    /// Whether the cached matches came from a multi-term (path) query.
+    last_multi: bool,
 }
 
 impl Searcher {
@@ -136,6 +203,7 @@ impl Searcher {
         self.last_sort = None;
         self.last_ordered = 0;
         self.last_generation = 0;
+        self.last_multi = false;
     }
 
     pub fn search(&mut self, idx: &Index, q: &Query) -> SearchResult {
@@ -166,6 +234,11 @@ impl Searcher {
             };
         }
 
+        // Several terms mean a different question is being asked — of the
+        // path rather than of the name — so a cached set from the other kind
+        // cannot be narrowed into this one.
+        let multi = matches!(q.mode, MatchMode::Substring) && terms(&q.text).len() > 1;
+
         // Narrowing is only sound when three things hold: the filters are
         // unchanged, the new text extends the old (so any match for the longer
         // needle is necessarily a match for the shorter one), and the index has
@@ -174,7 +247,11 @@ impl Searcher {
         // result set to be narrowed from. A name prefix narrows the same way a
         // substring does: a longer prefix cannot admit a name a shorter one
         // rejected.
+        // Going from one term to several widens what counts as a match from
+        // names to whole paths, and a node matching only through an ancestor
+        // was never in the single-term set to be narrowed from.
         let can_narrow = matches!(q.mode, MatchMode::Substring | MatchMode::NamePrefix)
+            && self.last_multi == multi
             && self.last_key.as_deref() == Some(key.as_str())
             && !self.last_text.is_empty()
             && q.text.len() >= self.last_text.len()
@@ -196,6 +273,7 @@ impl Searcher {
         self.last_text = q.text.clone();
         self.last_key = Some(key);
         self.last_generation = idx.generation();
+        self.last_multi = multi;
         let total = matches.len();
 
         // Display order is a second copy: `last_matches` has to stay in node
@@ -243,10 +321,19 @@ fn text_matches(idx: &Index, n: u32, q: &Query) -> bool {
     let name = idx.name(n);
     match q.mode {
         MatchMode::Substring => {
-            if q.case_sensitive {
-                name.contains(&q.text)
-            } else {
-                contains_ascii_ci(name.as_bytes(), q.text.as_bytes())
+            // Several terms are a question about the path, so they are asked
+            // of the path. One term stays a question about the name, which is
+            // both what people expect and the fast path.
+            let parts = terms(&q.text);
+            match parts.len() {
+                // Only whitespace: nothing has been asked yet.
+                0 => true,
+                // The term, not the raw text. Now that whitespace separates
+                // terms, "sso " has to keep behaving like "sso" while the
+                // second word is still being typed, rather than matching
+                // nothing because no name contains a trailing space.
+                1 => name_contains(name.as_bytes(), parts[0].as_bytes(), q.case_sensitive),
+                _ => path_matches(idx, n, &parts, q.case_sensitive),
             }
         }
         MatchMode::NamePrefix => {
@@ -321,6 +408,17 @@ fn passes_filters(idx: &Index, n: u32, q: &Query) -> bool {
 /// `needle.len() - 1` bytes so a match straddling a chunk boundary is still
 /// found, and matches are attributed to the chunk that contains their start.
 fn full_scan(idx: &Index, q: &Query) -> Vec<u32> {
+    // Whitespace separates terms, so what gets scanned for is the term, not
+    // the text as typed: padding must not be part of the needle.
+    let mut single = q.text.as_str();
+    if matches!(q.mode, MatchMode::Substring) {
+        let parts = terms(&q.text);
+        match parts.len() {
+            0 => return all_eligible(idx, q),
+            1 => single = parts[0],
+            _ => return multi_term_scan(idx, q, &parts),
+        }
+    }
     if matches!(q.mode, MatchMode::Glob | MatchMode::NamePrefix) {
         // Globs are anchored to whole names, so there is nothing to scan for
         // in the arena; test names directly. Prefix matches go the same way:
@@ -333,7 +431,7 @@ fn full_scan(idx: &Index, q: &Query) -> Vec<u32> {
     }
 
     let hay = idx.names.as_bytes();
-    let needle = q.text.as_bytes();
+    let needle = single.as_bytes();
     if needle.is_empty() || hay.is_empty() {
         return all_eligible(idx, q);
     }
@@ -382,6 +480,127 @@ fn full_scan(idx: &Index, q: &Query) -> Vec<u32> {
     nodes.dedup();
     nodes.retain(|&n| passes_filters(idx, n, q));
     nodes
+}
+
+/// Nodes whose own name contains `needle`, ignoring every filter.
+///
+/// The arena scan, extracted so each term of a multi-term query can use it.
+fn scan_names(idx: &Index, needle: &[u8], case_sensitive: bool) -> Vec<u32> {
+    let hay = idx.names.as_bytes();
+    if needle.is_empty() || hay.is_empty() || needle.len() > hay.len() {
+        return Vec::new();
+    }
+
+    let threads = rayon::current_num_threads().max(1);
+    let chunk = (hay.len() / threads).max(1 << 20);
+    let overlap = needle.len() - 1;
+
+    let mut nodes: Vec<u32> = (0..hay.len())
+        .step_by(chunk)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .flat_map_iter(|start| {
+            let end = (start + chunk).min(hay.len());
+            let scan_end = (end + overlap).min(hay.len());
+            let window = &hay[start..scan_end];
+
+            let positions: Vec<usize> = if case_sensitive {
+                memmem::find_iter(window, needle)
+                    .map(|p| start + p)
+                    .collect()
+            } else {
+                find_iter_ascii_ci(window, needle)
+                    .map(|p| start + p)
+                    .collect()
+            };
+
+            positions
+                .into_iter()
+                .filter(move |&p| p >= start && p < end)
+                .filter_map(|p| node_containing(idx, p, needle.len()))
+        })
+        .collect();
+
+    // A renamed node still has its old name in the arena, so a hit there is
+    // stale; those nodes are tested against their real names instead.
+    nodes.retain(|&n| idx.flags[n as usize] & flags::NAME_OVERRIDDEN == 0);
+    nodes.extend(
+        idx.overrides()
+            .nodes()
+            .filter(|&n| name_contains(idx.name_bytes(n), needle, case_sensitive)),
+    );
+    nodes.sort_unstable();
+    nodes.dedup();
+    nodes
+}
+
+/// Match several terms against whole paths.
+///
+/// Testing every node's whole path directly would mean millions of ancestor
+/// walks. Instead each term is scanned for once across the arena — the same
+/// cheap SIMD pass a single-term search uses — and the per-name hits are
+/// pushed down the tree in one linear pass, so a node inherits every term its
+/// ancestors matched. That leaves a small candidate set, which the
+/// authoritative walk then confirms.
+fn multi_term_scan(idx: &Index, q: &Query, parts: &[&str]) -> Vec<u32> {
+    let n = idx.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let capped = parts.len().min(MASK_TERMS);
+    let mut own = vec![0u8; n];
+    for (i, term) in parts.iter().take(capped).enumerate() {
+        for node in scan_names(idx, term.as_bytes(), q.case_sensitive) {
+            own[node as usize] |= 1 << i;
+        }
+    }
+    let all: u8 = if capped >= MASK_TERMS {
+        u8::MAX
+    } else {
+        (1u8 << capped) - 1
+    };
+
+    // Push each node's terms down to its descendants. Walking up from every
+    // node and memoising as we go visits each node once overall, which a
+    // naive per-node walk would not.
+    let mut acc = vec![0u8; n];
+    let mut done = vec![false; n];
+    let mut stack: Vec<u32> = Vec::new();
+
+    for start in 0..n as u32 {
+        if done[start as usize] {
+            continue;
+        }
+        stack.clear();
+        let mut cur = start;
+        let inherited = loop {
+            if done[cur as usize] {
+                break acc[cur as usize];
+            }
+            stack.push(cur);
+            let parent = idx.parent[cur as usize];
+            // Root, or a parent chain too broken or too deep to trust.
+            if parent == cur || parent as usize >= n || stack.len() > 4096 {
+                break 0;
+            }
+            cur = parent;
+        };
+
+        let mut carry = inherited;
+        while let Some(node) = stack.pop() {
+            carry |= own[node as usize];
+            acc[node as usize] = carry;
+            done[node as usize] = true;
+        }
+    }
+
+    (0..n as u32)
+        .into_par_iter()
+        .filter(|&node| acc[node as usize] == all)
+        .filter(|&node| passes_filters(idx, node, q))
+        .filter(|&node| path_matches(idx, node, parts, q.case_sensitive))
+        .collect()
 }
 
 /// Map an arena offset to the node whose name contains it.
