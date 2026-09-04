@@ -644,18 +644,23 @@ fn handle_key(app: &mut App, key: KeyEvent, visible: usize) {
     match key.code {
         // Ctrl arms must come before the plain-character arm below, or
         // these letters would be typed into the query instead.
-        KeyCode::Char('c') if ctrl => app.quit = true,
-        KeyCode::Char('u') if ctrl => app.clear_query(),
-        KeyCode::Char('w') if ctrl => app.delete_word(),
-        KeyCode::Char('s') if ctrl => app.cycle_sort(),
-        KeyCode::Char('t') if ctrl => app.cycle_kind(),
+        //
+        // Both cases, because Caps Lock is a modifier as far as the terminal
+        // is concerned: with it on, Ctrl+S arrives as `Char('S')` and matching
+        // only lowercase silently does nothing. Shift+Ctrl+S lands here too,
+        // which is what anyone pressing it would expect.
+        KeyCode::Char('c' | 'C') if ctrl => app.quit = true,
+        KeyCode::Char('u' | 'U') if ctrl => app.clear_query(),
+        KeyCode::Char('w' | 'W') if ctrl => app.delete_word(),
+        KeyCode::Char('s' | 'S') if ctrl => app.cycle_sort(),
+        KeyCode::Char('t' | 'T') if ctrl => app.cycle_kind(),
         // Reclaim the rail's columns for paths without leaving the app.
-        KeyCode::Char('b') if ctrl => app.rail = !app.rail,
-        KeyCode::Char('e') if ctrl => enter_explorer(app),
+        KeyCode::Char('b' | 'B') if ctrl => app.rail = !app.rail,
+        KeyCode::Char('e' | 'E') if ctrl => enter_explorer(app),
         // The duplicate scan reads file contents, so it can take a while.
         // Announce it before the request blocks the loop, so the user sees
         // why the UI has gone quiet instead of a frozen result box.
-        KeyCode::Char('d') if ctrl => {
+        KeyCode::Char('d' | 'D') if ctrl => {
             if app.mode != Mode::Dupes && app.dupes_pending {
                 app.status = "scanning for duplicates; hashing file contents...".into();
             }
@@ -1001,6 +1006,49 @@ mod tests {
         // file they have since navigated away from would be baffling.
         press(&mut app, KeyCode::Down);
         assert_eq!(app.pending_file, None, "the second step must not survive");
+    }
+
+    #[test]
+    fn the_shortcuts_still_work_with_caps_lock_on() {
+        // Caps Lock is a modifier as far as the terminal is concerned: it
+        // sends `Char('S')`, so matching only lowercase made every Ctrl
+        // shortcut quietly stop working.
+        let mut app = App::default();
+        let before = app.sort;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('S'), KeyModifiers::CONTROL),
+            10,
+        );
+        assert_ne!(app.sort, before, "Ctrl+Shift+S must still cycle the sort");
+
+        let mut app = App::default();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('E'), KeyModifiers::CONTROL),
+            10,
+        );
+        assert_eq!(
+            app.mode,
+            crate::tui::Mode::Explore,
+            "Ctrl+Shift+E must still explore"
+        );
+
+        let mut app = App::default();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL),
+            10,
+        );
+        assert!(app.quit, "Ctrl+Shift+C must still quit");
+    }
+
+    #[test]
+    fn an_uppercase_letter_with_no_ctrl_is_still_just_typing() {
+        // The fix must not swallow capitals into shortcuts.
+        let mut app = App::default();
+        press(&mut app, KeyCode::Char('S'));
+        assert_eq!(app.query, "S");
     }
 
     fn press(app: &mut App, code: KeyCode) {

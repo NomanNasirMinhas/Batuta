@@ -166,13 +166,16 @@ ones a single missed guard away from firing.
 | key | |
 |---|---|
 | arrows | move within a pane; cross to the next one at its edge |
-| `Ctrl+Left` / `Ctrl+Right` | cross regardless of position |
+| `Ctrl` + any arrow | move between panes regardless of where the caret is |
 | `Enter` | expand a directory, open a file, or go to a typed path |
 | `Shift+Enter` | open in the default application |
 | `Ctrl+S` | save |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo |
 | `F5` | re-read the directory |
 | `Esc` | back to search |
+
+`Ctrl` with any arrow moves between panes outright, whatever the caret is
+doing — down reaches the path bar, up comes back to whichever pane you left.
 
 Arrow-crossing has two deliberate exceptions, both because the literal rule is
 worse. The editor crosses left only at the very start of the buffer — at any
@@ -499,7 +502,7 @@ precisely which parts did not happen.
 cargo test --workspace
 ```
 
-476 tests, none of which require elevation. The MFT parser is exercised against
+482 tests, none of which require elevation. The MFT parser is exercised against
 hand-built records covering update-sequence fixups, resident and non-resident
 `$DATA`, fragmented run lists, `$ATTRIBUTE_LIST` spill of both sizes *and*
 names, hard links, DOS 8.3 aliases, alternate data streams, and deliberately

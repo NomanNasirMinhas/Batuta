@@ -200,21 +200,32 @@ impl Explorer {
 
         // Always available, whatever has focus.
         match key.code {
-            KeyCode::Char('c') if ctrl => return Action::Quit,
-            KeyCode::Char('s') if ctrl => return Action::Save,
+            // Both cases: Caps Lock makes these arrive uppercase, and a
+            // shortcut that quietly stops working is worse than one that
+            // never existed.
+            KeyCode::Char('c' | 'C') if ctrl => return Action::Quit,
+            KeyCode::Char('s' | 'S') if ctrl => return Action::Save,
             KeyCode::Esc => return Action::Leave,
             KeyCode::F(5) => {
                 self.tree.refresh();
                 return Action::None;
             }
-            // An explicit way across, for anyone who finds edge-crossing
-            // fiddly. Checked before the per-pane arrows so it always wins.
+            // The explicit way across, whatever the caret is doing.
+            // Checked before the per-pane arrows so it always wins.
             KeyCode::Left if ctrl => {
                 self.cross_left();
                 return Action::None;
             }
             KeyCode::Right if ctrl => {
                 self.cross_right();
+                return Action::None;
+            }
+            KeyCode::Down if ctrl => {
+                self.cross_down();
+                return Action::None;
+            }
+            KeyCode::Up if ctrl => {
+                self.cross_up();
                 return Action::None;
             }
             _ => {}
@@ -232,6 +243,22 @@ impl Explorer {
             Focus::Editor | Focus::Path => Focus::Tree,
             Focus::Tree => Focus::Tree,
         };
+    }
+
+    /// Into the path bar, remembering where to come back to.
+    fn cross_down(&mut self) {
+        if self.focus != Focus::Path {
+            self.last_pane = self.focus;
+            self.focus = Focus::Path;
+        }
+    }
+
+    /// Back out of the path bar. Above the other two panes there is nothing,
+    /// so this only does something from there.
+    fn cross_up(&mut self) {
+        if self.focus == Focus::Path {
+            self.focus = self.last_pane;
+        }
     }
 
     fn cross_right(&mut self) {
@@ -334,10 +361,10 @@ impl Explorer {
             KeyCode::Tab => doc.buffer.insert_str("    "),
             KeyCode::Backspace => doc.buffer.backspace(),
             KeyCode::Delete => doc.buffer.delete(),
-            KeyCode::Char('z') if ctrl => {
+            KeyCode::Char('z' | 'Z') if ctrl => {
                 doc.buffer.undo();
             }
-            KeyCode::Char('y') if ctrl => {
+            KeyCode::Char('y' | 'Y') if ctrl => {
                 doc.buffer.redo();
             }
             KeyCode::Char(c) if !ctrl => {
@@ -519,6 +546,66 @@ mod tests {
         assert_eq!(x.focus, Focus::Path);
         x.key(key(KeyCode::Up), 10, &fs);
         assert_eq!(x.focus, Focus::Editor, "back where it came from");
+    }
+
+    #[test]
+    fn the_explorers_shortcuts_survive_caps_lock() {
+        let fs = Fake::new(&[]);
+        let mut x = with_doc();
+        assert_eq!(
+            x.key(
+                KeyEvent::new(KeyCode::Char('S'), KeyModifiers::CONTROL),
+                10,
+                &fs
+            ),
+            Action::Save,
+            "Ctrl+Shift+S must still save"
+        );
+
+        x.focus = Focus::Editor;
+        x.key(key(KeyCode::Char('X')), 10, &fs);
+        x.key(
+            KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::CONTROL),
+            10,
+            &fs,
+        );
+        assert_eq!(
+            x.doc.as_ref().unwrap().buffer.text(),
+            "one\ntwo",
+            "Ctrl+Shift+Z must still undo"
+        );
+    }
+
+    #[test]
+    fn a_capital_letter_without_ctrl_is_typed_into_the_buffer() {
+        // Capitals must reach the file, not be mistaken for a shortcut.
+        let fs = Fake::new(&[]);
+        let mut x = with_doc();
+        x.focus = Focus::Editor;
+        x.doc.as_mut().unwrap().buffer.goto(Cursor::new(0, 0));
+        for c in "SZY".chars() {
+            x.key(key(KeyCode::Char(c)), 10, &fs);
+        }
+        assert_eq!(x.doc.as_ref().unwrap().buffer.text(), "SZYone\ntwo");
+    }
+
+    #[test]
+    fn ctrl_arrows_reach_every_pane_including_the_path_bar() {
+        let fs = Fake::new(&[]);
+        let mut x = with_doc();
+        x.focus = Focus::Editor;
+
+        x.key(ctrl(KeyCode::Down), 10, &fs);
+        assert_eq!(x.focus, Focus::Path);
+        x.key(ctrl(KeyCode::Up), 10, &fs);
+        assert_eq!(x.focus, Focus::Editor, "back where it came from");
+
+        x.key(ctrl(KeyCode::Left), 10, &fs);
+        assert_eq!(x.focus, Focus::Tree);
+        x.key(ctrl(KeyCode::Down), 10, &fs);
+        assert_eq!(x.focus, Focus::Path);
+        x.key(ctrl(KeyCode::Up), 10, &fs);
+        assert_eq!(x.focus, Focus::Tree, "and back to the tree this time");
     }
 
     #[test]

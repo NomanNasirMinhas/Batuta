@@ -28,9 +28,16 @@ use std::time::SystemTime;
 
 use super::buffer::{Buffer, Ending};
 
-/// Files above this are reported rather than loaded. The buffer keeps one
-/// `String` per line and edits a line in place, so this bounds the worst case.
-pub const MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Files above this are reported rather than loaded.
+///
+/// Size alone is the weakest of the three limits. The buffer keeps one
+/// `String` per line, so what actually costs memory is the *number* of lines —
+/// a hundred megabytes of eighty-character lines is about 1.3M of them and
+/// perfectly workable, while the same bytes as one-character lines would be a
+/// hundred million and several gigabytes of `String` headers. `MAX_LINES` is
+/// the limit doing that work; this one just stops a huge file being read into
+/// memory before anything can be judged.
+pub const MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 /// A single line longer than this is both unusable in a line editor and strong
 /// evidence the file is not really text — a minified bundle, or a blob.
@@ -183,17 +190,28 @@ pub fn inspect(bytes: &[u8]) -> Loaded {
     )))
 }
 
-/// Read a file, deciding whether it is editable text.
-pub fn load(path: &Path) -> io::Result<Loaded> {
-    // Checked before reading, so a 4 GB file is never pulled into memory to
-    // find out it is too big.
-    let size = std::fs::metadata(path)?.len();
-    if size > MAX_BYTES {
-        return Ok(Loaded::Rejected(format!(
+/// The refusal for an oversized file, or `None` if it fits.
+///
+/// Split out so the limit can be tested without writing a file of that size:
+/// a unit test that puts a hundred megabytes on disk is slow, wears the drive
+/// and tells you nothing the arithmetic does not.
+fn too_large(size: u64) -> Option<Loaded> {
+    (size > MAX_BYTES).then(|| {
+        Loaded::Rejected(format!(
             "This file is {:.1} MB. Batuta edits files up to {} MB.",
             size as f64 / (1024.0 * 1024.0),
             MAX_BYTES / (1024 * 1024)
-        )));
+        ))
+    })
+}
+
+/// Read a file, deciding whether it is editable text.
+pub fn load(path: &Path) -> io::Result<Loaded> {
+    // Checked before reading, so a 4 GB file is never pulled into memory just
+    // to find out it is too big.
+    let size = std::fs::metadata(path)?.len();
+    if let Some(refusal) = too_large(size) {
+        return Ok(refusal);
     }
     Ok(inspect(&std::fs::read(path)?))
 }
@@ -542,14 +560,27 @@ mod tests {
 
     #[test]
     fn an_oversized_file_is_reported_rather_than_loaded() {
-        let dir = scratch("big");
-        let path = dir.join("big.bin");
-        std::fs::write(&path, vec![b'x'; (MAX_BYTES + 1) as usize]).unwrap();
-
-        match load(&path).unwrap() {
-            Loaded::Rejected(why) => assert!(why.contains("up to"), "{why}"),
-            Loaded::Text(_) => panic!("should have been refused"),
+        assert!(too_large(MAX_BYTES).is_none(), "exactly the limit is fine");
+        match too_large(MAX_BYTES + 1) {
+            Some(Loaded::Rejected(why)) => {
+                assert!(why.contains("100 MB"), "the limit should be named: {why}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_line_count_is_what_actually_bounds_memory() {
+        // A file can be well under the byte limit and still be hopeless: one
+        // `String` per line is what costs, not the bytes.
+        let many = "\n".repeat(MAX_LINES + 1);
+        assert!(
+            (many.len() as u64) < MAX_BYTES,
+            "precondition: comfortably under the size limit"
+        );
+        match inspect(many.as_bytes()) {
+            Loaded::Rejected(why) => assert!(why.contains("lines"), "{why}"),
+            Loaded::Text(_) => panic!("should have been refused on line count"),
+        }
     }
 }
