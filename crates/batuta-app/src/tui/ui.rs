@@ -25,6 +25,28 @@ fn dim() -> Color {
     theme().dim()
 }
 
+/// The screen behind everything.
+///
+/// Foreground and background are always set together: a painted background
+/// with an inherited foreground puts a light scheme's black text on our
+/// charcoal, so the theme pairs them and this never splits them apart.
+fn base_style() -> Style {
+    let style = Style::default().fg(theme().text());
+    match theme().bg() {
+        Some(bg) => style.bg(bg),
+        None => style,
+    }
+}
+
+/// A panel's fill: one step up from the screen behind it.
+fn surface_style() -> Style {
+    let style = Style::default().fg(theme().text());
+    match theme().surface() {
+        Some(bg) => style.bg(bg),
+        None => style,
+    }
+}
+
 /// Each mode carries its own accent: the frame's border, its title, the mode
 /// pill, and the selected row all tint to it, so the mode you are in is legible
 /// before you read anything.
@@ -40,14 +62,11 @@ fn size_color(size: u64) -> Option<Color> {
 /// A framed panel in the current theme, so border style is decided in one
 /// place rather than at every call site.
 fn panel(border: Color) -> Block<'static> {
-    let block = Block::default()
+    Block::default()
         .borders(Borders::ALL)
         .border_type(theme().border_type())
-        .border_style(Style::default().fg(border));
-    match theme().panel() {
-        Some(bg) => block.style(Style::default().bg(bg)),
-        None => block,
-    }
+        .border_style(Style::default().fg(border))
+        .style(surface_style())
 }
 
 fn size_style(size: u64) -> Style {
@@ -67,6 +86,10 @@ fn selected_style(i: usize, cursor: Option<usize>, accent: Color) -> Style {
 /// Draw a frame; returns how many result rows are visible.
 pub fn draw(f: &mut Frame, app: &App) -> usize {
     let panes = layout::compute(f.area(), app.rail);
+
+    // Painted first so every pane sits on a known ground rather than on
+    // whatever the terminal happened to have behind it.
+    f.render_widget(Block::default().style(base_style()), f.area());
 
     if let Some(rail) = panes.rail {
         draw_rail(f, rail, app);
@@ -215,6 +238,10 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
     let accent = mode_accent(app.mode);
     let mut lines: Vec<Line> = Vec::new();
 
+    // Inside the border. The active row is filled edge to edge, so it reads
+    // as a selected item rather than as differently-coloured text.
+    let inner = area.width.saturating_sub(2) as usize;
+
     let section = |lines: &mut Vec<Line>, title: &str, items: Vec<(bool, &'static str)>| {
         if !lines.is_empty() {
             lines.push(Line::raw(""));
@@ -226,18 +253,19 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
         for (active, label) in items {
             // The marker carries the state as well as the colour does, so the
             // rail still reads correctly with no colour at all.
-            let (marker, style) = if active {
-                (
-                    "\u{25b8} ",
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                )
+            let text = format!("{} {label}", if active { "\u{25b8}" } else { " " });
+            let style = if active {
+                Style::default()
+                    .bg(accent)
+                    .fg(theme().on_accent())
+                    .add_modifier(Modifier::BOLD)
             } else {
-                ("  ", Style::default().fg(dim()))
+                Style::default().fg(dim())
             };
-            lines.push(Line::from(vec![
-                Span::styled(marker, style),
-                Span::styled(label, style),
-            ]));
+            // Padded so the fill spans the pane; a bar that stopped at the end
+            // of the word would look like a highlight, not a selection.
+            let padded = format!("{text:<inner$}");
+            lines.push(Line::from(Span::styled(padded, style)));
         }
     };
 
@@ -515,9 +543,19 @@ fn path_spans(
     }
 
     let (p, n) = (path.as_bytes(), needle.as_bytes());
-    let at = (0..=p.len().saturating_sub(n.len()))
-        .find(|&i| p[i..i + n.len()].eq_ignore_ascii_case(n))
-        .filter(|&i| i + n.len() <= p.len());
+    // A needle longer than the path cannot match, and must not be searched
+    // for. `saturating_sub` collapsed that case to the range `0..=0`, which
+    // then sliced `p[0..n.len()]` straight past the end of the path — the
+    // guard below it ran on the result of `find`, far too late to prevent it.
+    //
+    // This is not a corner case: while browsing a path the rows are matched
+    // by directory, and the needle is only the segment being typed, so a row
+    // whose whole path is shorter than what has been typed is ordinary.
+    let at = if n.is_empty() || n.len() > p.len() {
+        None
+    } else {
+        (0..=p.len() - n.len()).find(|&i| p[i..i + n.len()].eq_ignore_ascii_case(n))
+    };
     // ASCII comparison cannot land inside a multi-byte character, but slicing
     // is the one place a bug here would panic, so stay defensive.
     let split = at.and_then(|i| {
@@ -681,9 +719,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 subtle,
             ));
         }
-        if app.elapsed_us > 0 {
+        if app.dupes_elapsed_us > 0 {
             left.push(Span::styled(
-                format!("  ·  {:.2}s", app.elapsed_us as f64 / 1_000_000.0),
+                format!("  ·  {:.2}s", app.dupes_elapsed_us as f64 / 1_000_000.0),
                 subtle,
             ));
         }
@@ -732,24 +770,40 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let state = format!("sort:{}  show:{}", app.sort.label(), app.kind.label());
-    let full = format!("{state}  │ Tab complete  Shift+Tab modes  Ctrl+S sort  Ctrl+T filter  Ctrl+B rail  Ctrl+D dupes  Enter open  Esc close");
-    // A middle tier, so the hints thin out rather than falling off a cliff
-    // from everything to nothing at one particular width.
-    let some =
-        format!("{state}  │ Shift+Tab modes  Ctrl+S sort  Ctrl+T filter  Enter open  Esc close");
+    let full = format!("{state}  │ Tab complete  Shift+Tab modes  Ctrl+S sort  Ctrl+T filter  Ctrl+B rail  Ctrl+D dupes  Enter reveal  Shift+Enter open  Esc close");
+    // Two middle tiers, so the hints thin out a rung at a time rather than
+    // falling off a cliff from everything to nothing. The rungs drop what is
+    // most guessable first: the rail and the duplicates shortcut before the
+    // sort and filter keys, and those before the two ways to act on a row.
+    //
+    // Enter and Shift+Enter always appear together. Showing one without the
+    // other reads as though it were the only way to act on a row, which is
+    // exactly the wrong thing to teach.
+    let some = format!("{state}  │ Tab complete  Shift+Tab modes  Ctrl+S sort  Ctrl+T filter  Enter reveal  Shift+Enter open  Esc close");
+    let core =
+        format!("{state}  │ Ctrl+S sort  Ctrl+T filter  Enter reveal  Shift+Enter open  Esc close");
     let short = format!("{state}  │ Esc close");
 
     // The status text is what the user needs; hints are a courtesy. Rather
-    // than dropping every hint the moment the full set stops fitting, fall
-    // back to the one key that gets them out, then to nothing.
+    // than dropping every hint the moment the full set stops fitting, step
+    // down a rung at a time, then to the one key that gets them out, then to
+    // nothing.
+    //
+    // The room reserved for the counters is measured rather than guessed. A
+    // fixed reserve was too small for a line like "4,204 matches · 1 of 4,204
+    // · 76.00ms · cached", so the counters were cut off mid-word and ran
+    // straight into the hints with no gap.
     //
     // Width is counted in characters, not bytes: these strings contain
     // multi-byte glyphs, and `len()` would over-reserve the right-hand column
     // and push the counters off screen.
-    const MIN_STATUS: u16 = 40;
-    let keys = [full, some, short]
+    let left_width: usize = left.iter().map(|s| s.content.chars().count()).sum();
+    /// Columns between the counters and the hints, so the two never touch.
+    const GAP: usize = 2;
+
+    let keys = [full, some, core, short]
         .into_iter()
-        .find(|k| area.width >= k.chars().count() as u16 + MIN_STATUS);
+        .find(|k| area.width as usize >= left_width + GAP + k.chars().count());
 
     let Some(keys) = keys else {
         f.render_widget(Paragraph::new(Line::from(left)), area);
@@ -757,8 +811,11 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     };
     let keys_width = keys.chars().count() as u16;
 
-    let chunks = Layout::horizontal([Constraint::Min(MIN_STATUS), Constraint::Length(keys_width)])
-        .split(area);
+    let chunks = Layout::horizontal([
+        Constraint::Min((left_width + GAP) as u16),
+        Constraint::Length(keys_width),
+    ])
+    .split(area);
 
     f.render_widget(
         Paragraph::new(Line::from(left)).style(Style::default().fg(accent)),
@@ -870,6 +927,101 @@ mod tests {
         assert!(marked.iter().any(|l| l.contains("BLOAT")), "{marked:?}");
         assert!(marked.iter().any(|l| l.contains("DIRS")), "{marked:?}");
         assert!(marked.iter().any(|l| l.contains("SIZE")), "{marked:?}");
+    }
+
+    #[test]
+    fn a_needle_longer_than_the_path_does_not_panic() {
+        // The crash this replaced: "range end index 43 out of range for slice
+        // of length 39", reached by typing a path segment longer than one of
+        // the rows being drawn.
+        let spans = path_spans(
+            r"D:\Android\SDK",
+            "a-much-longer-thing-than-the-path-itself",
+            false,
+            Color::Cyan,
+            false,
+        );
+        let whole: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(whole, r"D:\Android\SDK", "the path must survive intact");
+        assert_eq!(spans.len(), 1, "nothing matched, so nothing is split");
+    }
+
+    #[test]
+    fn a_needle_the_exact_length_of_the_path_still_matches() {
+        // The off-by-one either side of the fix: equal lengths must still be
+        // searched, and must still highlight.
+        let spans = path_spans("abc", "ABC", false, Color::Cyan, false);
+        let whole: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(whole, "abc");
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content.as_ref() == "abc"
+                    && s.style.add_modifier.contains(Modifier::BOLD)),
+            "an exact-length match should still be picked out"
+        );
+    }
+
+    #[test]
+    fn the_counters_are_never_cut_into_by_the_hints() {
+        // The failure this replaced rendered "... 76.00ms ·  ca" immediately
+        // followed by "sort:size", with the two runs of text touching.
+        let mut app = App::new(false);
+        app.apply_rows(rows(5), 4204, 76_000, 20);
+
+        for width in [90u16, 120, 150, 170, 200] {
+            let (screen, _) = render(&app, width, 12);
+            let status = screen.lines().last().unwrap();
+            // Whatever tier was chosen, the counters must appear whole.
+            assert!(
+                status.contains("4,204 matches"),
+                "counters cut off at {width}: {status}"
+            );
+            if let Some(at) = status.find("sort:") {
+                assert!(
+                    status[..at].ends_with("  "),
+                    "no gap before the hints at {width}: {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_rails_active_entry_is_filled_edge_to_edge() {
+        // A bar that stopped at the end of the word would read as coloured
+        // text, not as the selected item.
+        let app = App {
+            mode: Mode::Bloat,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // Find the row holding the active mode.
+        let row = (0..buf.area.height)
+            .find(|&y| {
+                (0..layout::RAIL_WIDTH)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .contains("BLOAT")
+            })
+            .expect("active rail entry");
+
+        let accent = mode_accent(Mode::Bloat);
+        // Inside the border, every cell carries the fill — including the
+        // padding past the end of the label.
+        for x in 1..layout::RAIL_WIDTH - 1 {
+            assert_eq!(
+                buf[(x, row)].style().bg,
+                Some(accent),
+                "column {x} of the active entry is not filled"
+            );
+        }
     }
 
     #[test]
@@ -1070,7 +1222,7 @@ mod tests {
 
         // Narrower still: the hints go entirely rather than crowding out the
         // counts, which are what the status line is actually for.
-        let (tiny, _) = render(&app, 60, 12);
+        let (tiny, _) = render(&app, 40, 12);
         assert!(!tiny.contains("Esc close"));
         assert!(
             tiny.contains("match"),
@@ -1092,6 +1244,10 @@ mod tests {
         assert!(screen.contains("Shift+Tab modes"), "mode hint missing");
         assert!(screen.contains("Ctrl+S sort"), "sort key hint missing");
         assert!(screen.contains("Ctrl+T filter"), "filter key hint missing");
+        assert!(
+            screen.contains("Shift+Enter open"),
+            "launch key hint missing"
+        );
         assert!(screen.contains("Esc close"), "close hint missing");
         assert!(
             !screen.contains("F2"),

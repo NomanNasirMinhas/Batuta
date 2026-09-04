@@ -81,12 +81,13 @@ go.
 | any character | refine the search |
 | `Ctrl+S` / `Ctrl+T` | cycle sort / filter by kind |
 | `Shift+Tab` | switch between search, bloat and duplicates |
-| `Tab` | complete the highlighted path (search view only) |
+| `Tab` | complete to the highlighted directory, or a file's directory then the file |
 | `Delete` | delete the highlighted file or folder, after confirming |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | move through results |
 | `Ctrl+B` | show or hide the rail |
 | `Ctrl+D` | jump straight to duplicates (and back) |
-| `Enter` | open the selected entry in Explorer, and close |
+| `Enter` | reveal the selected entry in Explorer, and close |
+| `Shift+Enter` | open it: a folder in Explorer, a file in its own application |
 | `Ctrl+W` / `Ctrl+U` | delete a word / clear the query without closing |
 | `Esc` | close |
 
@@ -94,10 +95,19 @@ Typing a path browses it: `C:\` lists the root of the drive, `C:\Users\`
 lists that directory, and `C:\Users\Dev` filters the directory to names
 starting with `Dev`. If the path names no indexed directory, the last
 segment falls back to a normal name search, so a typo still shows something.
-`Tab` completes the drill-down: the highlighted row's real path becomes the
-query (with a trailing separator for directories, so you keep narrowing
-inside it) — type `C:\Users`, highlight the account folder you want, press
-`Tab`, type on.
+`Tab` completes the drill-down: the highlighted directory's real path becomes
+the query, with a trailing separator so you keep narrowing inside it. It works
+from a plain name search too — you rarely know the path you want in advance,
+which is the whole reason for searching — so `downloads`, `Tab` on the folder
+you meant, and carry on typing inside it.
+
+A file completes in two steps. The first `Tab` lands in the directory holding
+it, which puts the siblings on screen and is usually what you were after; a
+second `Tab` names the file itself. Going straight there would leave a query
+matching only that one file, with nothing left to narrow. The file is
+remembered across the first step rather than re-derived, because completing the
+directory refetches and moves the selection off it — and any key other than
+`Tab` drops the second step.
 
 A rail down the left edge shows the mode, the kind filter and the sort order
 all at once, with the active entry in each marked. These were previously
@@ -122,12 +132,21 @@ is used, because a bare `Color::Cyan` is whatever the terminal decides it is and
 lands invisible on some light schemes: the palette drops to the sixteen ANSI
 colours when the terminal cannot do better, honours `NO_COLOR`, and picks
 rounded borders only where they actually render rather than as replacement
-boxes. Body text inherits the terminal's own foreground, and nothing has a
-filled background by default — a panel colour would have to know the terminal's
-own background to be safe, and there is no way to ask; set `BATUTA_PANELS` if
-you know yours is dark and want the layered look. Inside results, the part
+boxes.
+
+The interface paints its own background where the terminal can render 24-bit
+colour: a base tone for the screen and a lighter one for each panel, so the
+panes read as surfaces rather than as text floating on whatever was behind
+them. Doing that removes the option of inheriting the terminal's foreground —
+text that inherits is only legible against the background it was chosen for,
+and ours is now a known dark tone — so background and foreground are always set
+together, never one alone. In sixteen colours there is no tone subtle enough to
+sit behind a frame without swallowing it, so those terminals keep inheriting
+both, which is correct on any scheme. `BATUTA_NO_PANELS` opts out. Inside results, the part
 of each path your keystrokes picked out
-is bolded in the accent color, directories are tinted, sizes warm toward
+is bolded in the accent color, the rail's active entry in each section is a
+filled bar rather than differently-coloured text, directories are tinted, sizes
+warm toward
 yellow and red as they become worth acting on, the bloat view draws a share
 bar showing each directory's weight against the largest on screen, and the
 duplicates view prints each group's reclaimable bytes in red — the number
@@ -163,8 +182,9 @@ page. On 3.4M matches that was a **9.4 second** stall per keystroke, which read
 as a frozen UI. An allocation-free comparator, partial selection, and skipping
 UTF-8 revalidation on each access brought it to 76 ms.
 
-Reached by the hotkey it behaves as a launcher: it opens maximised, `Esc`
-dismisses it in one press, and opening a result closes it too. A failed open — a file the index
+Reached by the hotkey it behaves as a launcher: a borderless, title-barless
+panel centred on the work area rather than a full-screen command window. `Esc`
+dismisses it in one press, and acting on a result closes it too. A failed open — a file the index
 still lists but the disk no longer has — leaves the window up so the reason
 stays readable.
 
@@ -177,6 +197,13 @@ directly in its own files. A directory that is large only because of one child
 is rarely the one worth acting on; the two columns separate those cases, and a
 share bar next to them shows each directory's weight against the largest one
 on screen, so the shape of the list is legible without reading a number.
+
+The duplicates scan runs off the UI thread. It reads file contents and takes
+seconds, and doing that inline froze everything: no mode switch, no scrolling,
+not even quitting until it finished. It is handed to a worker and collected
+when ready, so the rest of the interface stays live while it runs — and because
+it can now land while you are looking at something else, it fills its cache
+without taking over that view's selection, window or counters.
 
 The duplicates view (`Ctrl+D`, or Shift+Tab cycling) maps each byte-identical file against
 the paths holding its copies: a divider row names the group — how many copies,
@@ -377,7 +404,7 @@ precisely which parts did not happen.
 cargo test --workspace
 ```
 
-375 tests, none of which require elevation. The MFT parser is exercised against
+391 tests, none of which require elevation. The MFT parser is exercised against
 hand-built records covering update-sequence fixups, resident and non-resident
 `$DATA`, fragmented run lists, `$ATTRIBUTE_LIST` spill of both sizes *and*
 names, hard links, DOS 8.3 aliases, alternate data streams, and deliberately

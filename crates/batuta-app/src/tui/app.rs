@@ -139,6 +139,11 @@ pub struct App {
     pub dupes_window: Vec<DupeEntry>,
     /// A duplicate scan is due before the next draw.
     pub dupes_pending: bool,
+
+    /// How long the last duplicate scan took. Kept apart from `elapsed_us`
+    /// because a scan can now finish while another view is on screen, and it
+    /// must not overwrite that view's timing.
+    pub dupes_elapsed_us: u64,
     /// Reclaimable bytes across all groups in `dupes`.
     pub dupes_wasted: u64,
 
@@ -150,6 +155,14 @@ pub struct App {
     /// Show the rail. On by default; the layout still withholds it when the
     /// terminal is too narrow to spare the columns.
     pub rail: bool,
+
+    /// The file a first Tab stepped into the directory of, waiting for a
+    /// second Tab to name it.
+    ///
+    /// It has to be remembered rather than re-derived: the first Tab changes
+    /// the query, which refetches and resets the selection, so by the time the
+    /// second Tab arrives the file is no longer the highlighted row.
+    pub pending_file: Option<String>,
 
     /// A refetch is needed before the next draw.
     pub dirty: bool,
@@ -167,6 +180,7 @@ impl Default for App {
             sort: Sort::Name,
             kind: Kind::All,
             rail: true,
+            pending_file: None,
             rows: Vec::new(),
             window_start: 0,
             selected: 0,
@@ -175,6 +189,7 @@ impl Default for App {
             dupes: Vec::new(),
             dupes_window: Vec::new(),
             dupes_pending: true,
+            dupes_elapsed_us: 0,
             dupes_wasted: 0,
             confirm_delete: None,
             dirty: true,
@@ -301,19 +316,69 @@ impl App {
     /// query is not path-shaped: completing a plain name search to a full path
     /// would be a jump nobody asked for, and Tab falls back to switching modes
     /// there instead.
+    /// The directory part of a path, if it has one.
+    fn parent_dir(path: &str) -> Option<&str> {
+        let (dir, name) = path.rsplit_once(['\\', '/'])?;
+        // A bare drive (`D:`) is a legitimate parent and becomes `D:\` once
+        // the separator is appended; an empty one is not a path at all.
+        (!dir.is_empty() && !name.is_empty()).then_some(dir)
+    }
+
+    /// The completed text for the highlighted row.
+    ///
+    /// This deliberately does not require the query to already look like a
+    /// path. Searching broadly by name and then drilling into whichever hit
+    /// looks right is the natural way to use this: you rarely know the path
+    /// you want in advance, which is the entire reason for searching.
+    ///
+    /// A directory completes to itself. A file completes in two steps —
+    /// first to the directory holding it, then, on a second Tab, to the file.
+    /// Going straight to the file would replace the query with one matching
+    /// only that file: a dead end with nothing left to narrow. Landing in its
+    /// directory first puts the siblings on screen, which is usually what you
+    /// were looking for anyway, and the second Tab is there when it is not.
     pub fn complete_selection(&self) -> Option<String> {
         if self.mode != Mode::Search {
             return None;
         }
+
+        // Second Tab: the first stepped into the directory, this names the
+        // file it was holding.
+        if let Some(file) = &self.pending_file {
+            return Some(file.clone());
+        }
+
         let row = self.current()?;
-        if !crate::query::looks_like_path(&self.query) {
+        // The trailing separator is what makes the completion land ready to
+        // keep narrowing inside the directory rather than alongside it.
+        if row.is_dir {
+            return Some(format!("{}\\", row.path));
+        }
+
+        // Already sitting on the file itself: stepping back to its directory
+        // would undo the last Tab rather than continue it.
+        if self.query == row.path {
             return None;
         }
-        let mut text = row.path.clone();
-        if row.is_dir {
-            text.push('\\');
-        }
-        Some(text)
+        Self::parent_dir(&row.path).map(|dir| format!("{dir}\\"))
+    }
+
+    /// Apply a Tab press.
+    pub fn complete(&mut self) {
+        let Some(text) = self.complete_selection() else {
+            return;
+        };
+        // Arm the second step only when the first one just happened; a second
+        // Tab consumes it rather than re-arming, so repeated presses settle
+        // instead of cycling between the directory and the file.
+        self.pending_file = if self.pending_file.is_some() {
+            None
+        } else {
+            self.current()
+                .filter(|row| !row.is_dir)
+                .map(|row| row.path.clone())
+        };
+        self.set_query(&text);
     }
 
     /// The text to highlight inside result paths.
@@ -508,8 +573,15 @@ impl App {
             .collect();
         self.dupes_pending = false;
         self.dupes_wasted = wasted_total;
-        self.window_dupes(visible);
-        self.elapsed_us = elapsed_us;
+        self.dupes_elapsed_us = elapsed_us;
+
+        // The scan runs off the UI thread, so it can land while the user is
+        // looking at something else. Filling the cache is always right;
+        // taking over the window, selection and counters is only right if the
+        // duplicates view is the one on screen.
+        if self.mode == Mode::Dupes {
+            self.window_dupes(visible);
+        }
     }
 
     /// Slice the cached duplicate scan into the loaded window.
@@ -790,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_row_completes_without_a_trailing_separator() {
+    fn a_file_completes_to_its_directory_first_and_itself_second() {
         let mut app = App {
             query: r"C:\data\file".into(),
             ..Default::default()
@@ -808,18 +880,152 @@ mod tests {
             0,
             10,
         );
-        assert_eq!(app.complete_selection().unwrap(), r"C:\data\file_0001.bin");
+        // First Tab: into the directory, so the siblings are on screen.
+        app.complete();
+        assert_eq!(app.query, r"C:\data\");
+
+        // Second Tab: the file itself, even though the refetch has moved the
+        // selection off it.
+        app.complete();
+        assert_eq!(app.query, r"C:\data\file_0001.bin");
     }
 
     #[test]
-    fn tab_completion_is_only_for_path_queries() {
-        // A plain name search did not ask to become a full path.
+    fn repeated_tabs_settle_instead_of_cycling() {
+        // Without the guard this ping-pongs: file, directory, file, directory.
         let mut app = App {
-            query: "report".into(),
+            query: "file".into(),
             ..Default::default()
         };
-        app.apply_rows(rows(3), 3, 0, 10);
-        assert_eq!(app.complete_selection(), None);
+        app.apply_rows(
+            vec![Row {
+                path: r"C:\data\file_0001.bin".into(),
+                size: 1,
+                mtime: 0,
+                is_dir: false,
+                files: 0,
+                own: 0,
+            }],
+            1,
+            0,
+            10,
+        );
+
+        app.complete();
+        app.complete();
+        let settled = app.query.clone();
+        app.complete();
+        assert_eq!(app.query, settled, "a third Tab must not step back out");
+    }
+
+    #[test]
+    fn a_directory_completes_in_one_step_with_nothing_pending() {
+        let mut app = App {
+            query: "downloads".into(),
+            ..Default::default()
+        };
+        app.apply_rows(
+            vec![Row {
+                path: r"D:\Downloads".into(),
+                size: 0,
+                mtime: 0,
+                is_dir: true,
+                files: 4,
+                own: 0,
+            }],
+            1,
+            0,
+            10,
+        );
+
+        app.complete();
+        assert_eq!(app.query, r"D:\Downloads\");
+        assert_eq!(
+            app.pending_file, None,
+            "a directory has no second step to arm"
+        );
+    }
+
+    #[test]
+    fn a_file_at_the_root_of_a_drive_completes_to_the_drive() {
+        let mut app = App {
+            query: "boot".into(),
+            ..Default::default()
+        };
+        app.apply_rows(
+            vec![Row {
+                path: r"D:\boot.ini".into(),
+                size: 1,
+                mtime: 0,
+                is_dir: false,
+                files: 0,
+                own: 0,
+            }],
+            1,
+            0,
+            10,
+        );
+        app.complete();
+        assert_eq!(app.query, r"D:\", "a bare drive is still a directory");
+    }
+
+    #[test]
+    fn tab_completes_from_a_plain_name_search_too() {
+        // You rarely know the path you want in advance — that is what the
+        // search is for. Finding a directory by name and pressing Tab has to
+        // drill into it, not refuse because the query was not already a path.
+        let mut app = App {
+            query: "downloads".into(),
+            ..Default::default()
+        };
+        app.apply_rows(
+            vec![Row {
+                path: r"D:\Downloads".into(),
+                size: 0,
+                mtime: 0,
+                is_dir: true,
+                files: 4,
+                own: 0,
+            }],
+            1,
+            0,
+            10,
+        );
+
+        assert_eq!(app.complete_selection().unwrap(), r"D:\Downloads\");
+    }
+
+    #[test]
+    fn completing_a_name_search_produces_something_that_actually_browses() {
+        // Textually right is not enough: the completed query has to be one
+        // the browser recognises, or Tab would land you on a path query that
+        // silently falls back to a name search.
+        let mut app = App {
+            query: "downloads".into(),
+            ..Default::default()
+        };
+        // A real directory name with a space in it, which is where naive
+        // path handling tends to come apart.
+        app.apply_rows(
+            vec![Row {
+                path: r"D:\Downloads\Asus Downloads".into(),
+                size: 1_320_000,
+                mtime: 1_788_134_400,
+                is_dir: true,
+                files: 3,
+                own: 0,
+            }],
+            1,
+            0,
+            10,
+        );
+
+        let done = app.complete_selection().expect("a directory completes");
+        assert_eq!(done, r"D:\Downloads\Asus Downloads\");
+        assert!(
+            crate::query::looks_like_path(&done),
+            "the completion must read as a path, or browsing it does nothing"
+        );
     }
 
     #[test]
@@ -935,6 +1141,36 @@ mod tests {
 
         app.toggle_dupes();
         assert_eq!(app.mode, Mode::Search, "a second press backs out");
+    }
+
+    #[test]
+    fn a_scan_landing_while_another_view_is_open_does_not_take_it_over() {
+        // The scan runs off the UI thread now, so it can finish at any moment
+        // — including while the user is halfway down a search result list.
+        // Filling the cache is right; moving their selection is not.
+        let mut app = App::default();
+        app.apply_rows(rows(40), 400, 0, 10);
+        app.selected = 17;
+        app.window_start = 12;
+        let (total, selected, start) = (app.total, app.selected, app.window_start);
+
+        assert_eq!(app.mode, Mode::Search, "precondition");
+        app.apply_dupes(dupe_groups(2, 2), 4096, 1_234_567, 10);
+
+        assert_eq!(app.total, total, "the search count was overwritten");
+        assert_eq!(app.selected, selected, "the selection moved");
+        assert_eq!(app.window_start, start, "the window scrolled");
+
+        // The cache still has to be filled, or coming back would rescan.
+        assert!(!app.dupes_pending, "the result should have been cached");
+        assert!(!app.dupes.is_empty());
+        assert_eq!(app.dupes_elapsed_us, 1_234_567);
+        assert_eq!(app.elapsed_us, 0, "the search timing must be left alone");
+
+        // And it slices into view on return, with no second scan.
+        app.mode = Mode::Dupes;
+        app.window_dupes(10);
+        assert!(app.total > 0);
     }
 
     #[test]

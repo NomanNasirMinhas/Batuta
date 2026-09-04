@@ -12,16 +12,23 @@
 //!    replacement boxes in the legacy Windows console, so the border style is a
 //!    token too, not a literal at forty call sites.
 //!
-//! ## Why nothing has a filled background by default
+//! ## Backgrounds come with an obligation
 //!
-//! Panels look layered in a screenshot because the author knew their terminal's
-//! background. We do not: a terminal reports no way to ask. Painting a dark
-//! panel behind text that inherits a light foreground produces black-on-black,
-//! so depth comes from borders and dimmed text instead, which is correct
-//! against any background. Someone who *knows* their terminal is dark can opt
-//! into filled panels by setting `BATUTA_PANELS`, and then the risk is theirs
-//! to take knowingly. Body text simply never sets a foreground at all, which
-//! is what makes it correct on a light scheme and a dark one alike.
+//! The interface paints its own background: a base tone for the screen and a
+//! lighter one for each panel, so the panes read as surfaces rather than as
+//! text floating on whatever is behind them.
+//!
+//! Doing that removes the option of inheriting the terminal's foreground. Text
+//! that inherits is only legible against the background it was chosen for, and
+//! ours is now a known dark tone, so a light scheme's black-on-white text would
+//! land black-on-charcoal. Painting a background therefore *requires* painting
+//! a foreground, and both are set together, never one alone.
+//!
+//! This only applies where the terminal can render 24-bit colour. In sixteen
+//! colours there is no tone subtle enough to sit behind a frame without
+//! swallowing it, so those terminals keep the inherit-everything behaviour,
+//! which is correct on any scheme. `BATUTA_NO_PANELS` opts out for anyone who
+//! prefers their own background showing through.
 
 use ratatui::style::Color;
 use ratatui::widgets::BorderType;
@@ -37,6 +44,19 @@ pub enum Palette {
     Ansi,
     /// No colour at all. Emphasis has to come from bold and reverse video.
     Mono,
+}
+
+/// What the surrounding environment says the terminal can do.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Env<'a> {
+    pub no_color: bool,
+    pub colorterm: Option<&'a str>,
+    pub term: Option<&'a str>,
+    /// Running under Windows Terminal, which is known to draw rounded borders.
+    pub windows_terminal: bool,
+    /// Running on Windows at all, where 24-bit colour is available but none
+    /// of the Unix capability variables are ever set.
+    pub windows: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,26 +88,30 @@ impl Theme {
     /// Split from [`Theme::detect`] so the rules are testable without setting
     /// process-wide environment variables, which tests cannot do safely in
     /// parallel.
-    pub fn resolve(
-        no_color: bool,
-        colorterm: Option<&str>,
-        term: Option<&str>,
-        windows_terminal: bool,
-    ) -> Self {
+    pub fn resolve(env: Env) -> Self {
         // NO_COLOR is a convention worth honouring exactly: any value at all,
         // including empty, means no colour.
-        if no_color {
+        if env.no_color {
             return Theme {
                 palette: Palette::Mono,
-                rounded: windows_terminal,
+                rounded: env.windows_terminal,
                 panels: false,
             };
         }
 
-        let truecolor = matches!(colorterm, Some(c) if {
-            let c = c.to_ascii_lowercase();
-            c.contains("truecolor") || c.contains("24bit")
-        }) || matches!(term, Some(t) if t.contains("256color") && windows_terminal);
+        // `COLORTERM` is a Unix convention. Nothing on Windows sets it, nor
+        // `TERM` — so asking for it there is asking a question that is always
+        // answered "no", and the interface fell back to sixteen colours on the
+        // one platform this program runs on. The console has supported 24-bit
+        // colour since Windows 10 1703, and crossterm turns on the virtual
+        // terminal processing that uses it, so Windows is taken as capable
+        // unless it says otherwise.
+        let truecolor = env.windows
+            || matches!(env.colorterm, Some(c) if {
+                let c = c.to_ascii_lowercase();
+                c.contains("truecolor") || c.contains("24bit")
+            })
+            || matches!(env.term, Some(t) if t.contains("256color"));
 
         Theme {
             palette: if truecolor {
@@ -97,32 +121,62 @@ impl Theme {
             },
             // The legacy console draws rounded corners as replacement glyphs,
             // so they are only used where something is known to support them.
-            rounded: windows_terminal,
-            panels: false,
+            // Colour degrades invisibly; a wrong glyph is a box on the screen,
+            // so this stays the conservative of the two checks.
+            rounded: env.windows_terminal,
+            // Only truecolor can pick tones subtle enough to layer; sixteen
+            // colours would swallow the frame, so those keep the terminal's
+            // own background.
+            panels: truecolor,
         }
     }
 
     /// Read the environment and decide.
     ///
-    /// `BATUTA_PANELS` opts into filled panel backgrounds. It is a deliberate
-    /// switch rather than a default because only the person at the keyboard
-    /// knows whether their terminal's own background is dark enough for it.
+    /// `BATUTA_NO_PANELS` turns off the painted background, for anyone who
+    /// would rather see their own terminal's through the interface.
     pub fn detect() -> Self {
-        Theme::resolve(
-            std::env::var_os("NO_COLOR").is_some(),
-            std::env::var("COLORTERM").ok().as_deref(),
-            std::env::var("TERM").ok().as_deref(),
-            std::env::var_os("WT_SESSION").is_some(),
-        )
-        .with_panels(std::env::var_os("BATUTA_PANELS").is_some())
+        Theme::resolve(Env {
+            no_color: std::env::var_os("NO_COLOR").is_some(),
+            colorterm: std::env::var("COLORTERM").ok().as_deref(),
+            term: std::env::var("TERM").ok().as_deref(),
+            windows_terminal: std::env::var_os("WT_SESSION").is_some(),
+            windows: cfg!(windows),
+        })
+        .with_panels(std::env::var_os("BATUTA_NO_PANELS").is_none())
     }
 
-    /// Turn on filled panel backgrounds, for a terminal known to be dark.
+    /// Turn the painted background on or off.
     pub fn with_panels(mut self, on: bool) -> Self {
-        // Only truecolor can pick a background subtle enough to be worth it;
-        // an ANSI black would swallow the frame.
+        // Sixteen colours cannot do this well, so the request is refused
+        // rather than honoured badly.
         self.panels = on && self.palette == Palette::True;
         self
+    }
+
+    /// The screen behind everything, or `None` to leave the terminal's own.
+    pub fn bg(&self) -> Option<Color> {
+        self.panels.then_some(Color::Rgb(17, 19, 24))
+    }
+
+    /// A panel's fill: one step up from [`Theme::bg`], so panes read as
+    /// surfaces sitting on the screen rather than holes cut into it.
+    pub fn surface(&self) -> Option<Color> {
+        self.panels.then_some(Color::Rgb(26, 29, 36))
+    }
+
+    /// Body text.
+    ///
+    /// `Reset` inherits the terminal's foreground, which is right whenever we
+    /// have not painted a background. Once we have, inheriting would put a
+    /// light scheme's black text on our charcoal, so an explicit tone is used
+    /// instead. The two decisions are the same decision.
+    pub fn text(&self) -> Color {
+        if self.panels {
+            Color::Rgb(222, 226, 233)
+        } else {
+            Color::Reset
+        }
     }
 
     pub fn border_type(&self) -> BorderType {
@@ -198,11 +252,6 @@ impl Theme {
         }
     }
 
-    /// A filled panel background, or `None` to inherit the terminal's.
-    pub fn panel(&self) -> Option<Color> {
-        self.panels.then_some(Color::Rgb(24, 27, 33))
-    }
-
     /// How loudly a size should read.
     ///
     /// The question a size column answers is "is this one worth acting on",
@@ -253,23 +302,60 @@ mod tests {
     #[test]
     fn no_color_wins_over_everything_else() {
         // The convention is that any value, empty included, disables colour.
-        let t = Theme::resolve(true, Some("truecolor"), Some("xterm-256color"), true);
+        let t = Theme::resolve(Env {
+            no_color: true,
+            colorterm: Some("truecolor"),
+            term: Some("xterm-256color"),
+            windows_terminal: true,
+            windows: true,
+        });
         assert_eq!(t.palette, Palette::Mono);
+        assert_eq!(t.bg(), None, "no colour means no painted background");
+        assert_eq!(t.text(), Color::Reset);
         assert_eq!(t.heat(100 * GIB), None, "no colour means no heat either");
         assert_eq!(t.accent(Mode::Search), Color::Reset);
     }
 
     #[test]
+    fn windows_gets_full_colour_without_any_unix_variables_being_set() {
+        // The regression this pins: `COLORTERM`, `TERM` and `WT_SESSION` are
+        // all unset on a stock Windows console, so asking only those questions
+        // dropped the one platform this program runs on to sixteen colours and
+        // no painted background at all.
+        let t = Theme::resolve(Env {
+            windows: true,
+            ..Env::default()
+        });
+        assert_eq!(t.palette, Palette::True);
+        assert!(t.bg().is_some(), "the background must actually be painted");
+
+        // NO_COLOR still wins there, as everywhere.
+        let off = Theme::resolve(Env {
+            windows: true,
+            no_color: true,
+            ..Env::default()
+        });
+        assert_eq!(off.palette, Palette::Mono);
+        assert_eq!(off.bg(), None);
+    }
+
+    #[test]
     fn truecolor_is_taken_from_colorterm() {
         for c in ["truecolor", "24bit", "TrueColor"] {
-            let t = Theme::resolve(false, Some(c), None, false);
+            let t = Theme::resolve(Env {
+                colorterm: Some(c),
+                ..Env::default()
+            });
             assert_eq!(t.palette, Palette::True, "COLORTERM={c}");
         }
     }
 
     #[test]
     fn an_unknown_terminal_falls_back_to_ansi_rather_than_guessing() {
-        let t = Theme::resolve(false, None, Some("dumb"), false);
+        let t = Theme::resolve(Env {
+            term: Some("dumb"),
+            ..Env::default()
+        });
         assert_eq!(t.palette, Palette::Ansi);
         // Every token must still resolve to something drawable.
         assert_eq!(t.border_type(), BorderType::Plain);
@@ -280,30 +366,77 @@ mod tests {
     fn rounded_borders_are_only_used_where_they_render() {
         // The legacy Windows console draws them as replacement glyphs.
         assert_eq!(
-            Theme::resolve(false, Some("truecolor"), None, false).border_type(),
+            Theme::resolve(Env {
+                colorterm: Some("truecolor"),
+                ..Env::default()
+            })
+            .border_type(),
             BorderType::Plain
         );
         assert_eq!(
-            Theme::resolve(false, Some("truecolor"), None, true).border_type(),
+            Theme::resolve(Env {
+                colorterm: Some("truecolor"),
+                windows_terminal: true,
+                ..Env::default()
+            })
+            .border_type(),
             BorderType::Rounded
         );
     }
 
     #[test]
-    fn panels_stay_off_unless_asked_for_and_affordable() {
-        let truecolor = Theme::resolve(false, Some("truecolor"), None, true);
-        assert_eq!(truecolor.panel(), None, "off by default");
-        assert!(truecolor.with_panels(true).panel().is_some());
+    fn a_painted_background_always_brings_a_foreground_with_it() {
+        // The pairing is the whole safety property: a background without an
+        // explicit foreground leaves a light scheme's black text on charcoal.
+        let painted = Theme::resolve(Env {
+            colorterm: Some("truecolor"),
+            windows_terminal: true,
+            ..Env::default()
+        });
+        assert!(painted.bg().is_some(), "truecolor should paint by default");
+        assert!(painted.surface().is_some());
+        assert_ne!(
+            painted.text(),
+            Color::Reset,
+            "painting a background obliges us to name the text colour"
+        );
 
-        // A filled panel in 16 colours would swallow the frame, so the request
-        // is refused rather than honoured badly.
-        let ansi = Theme::resolve(false, None, None, true);
-        assert_eq!(ansi.with_panels(true).panel(), None);
+        // And the converse: inherit the foreground exactly when we inherit
+        // the background.
+        let bare = painted.with_panels(false);
+        assert_eq!(bare.bg(), None);
+        assert_eq!(bare.text(), Color::Reset);
+    }
+
+    #[test]
+    fn sixteen_colour_terminals_keep_their_own_background() {
+        // No tone here is subtle enough to sit behind a frame.
+        let ansi = Theme::resolve(Env {
+            windows_terminal: true,
+            ..Env::default()
+        });
+        assert_eq!(ansi.bg(), None);
+        assert_eq!(ansi.text(), Color::Reset);
+        assert_eq!(ansi.with_panels(true).bg(), None, "request refused");
+    }
+
+    #[test]
+    fn a_panel_is_a_step_up_from_the_screen_behind_it() {
+        let t = Theme::resolve(Env {
+            colorterm: Some("truecolor"),
+            windows_terminal: true,
+            ..Env::default()
+        });
+        assert_ne!(t.bg(), t.surface(), "panels must be distinguishable");
     }
 
     #[test]
     fn heat_only_marks_sizes_worth_acting_on() {
-        let t = Theme::resolve(false, Some("truecolor"), None, true);
+        let t = Theme::resolve(Env {
+            colorterm: Some("truecolor"),
+            windows_terminal: true,
+            ..Env::default()
+        });
         assert_eq!(t.heat(0), None);
         assert_eq!(t.heat(99 * MIB), None, "small files must stay unmarked");
         assert!(t.heat(101 * MIB).is_some());

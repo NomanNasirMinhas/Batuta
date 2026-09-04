@@ -54,24 +54,97 @@ pub fn wait_for_enter() {
     }
 }
 
-/// Maximise the console window we were given.
+/// Fraction of the work area a floating launcher window occupies.
+const FLOAT_W: i32 = 72;
+const FLOAT_H: i32 = 68;
+
+/// Turn the console we were given into a borderless floating panel.
 ///
-/// Only worth doing for a window opened for us — the hotkey helper's new
-/// console, or a double-click. Resizing a terminal the user already had open
-/// would be rude.
+/// Only ever applied to a window opened *for* us — the hotkey helper's new
+/// console, or a double-click. Restyling a terminal the user already had open
+/// would be taking their window away from them.
+///
+/// A launcher should look like a launcher: no title bar to read, no resize
+/// grips to catch, centred where the eye already is. The window styles are
+/// stripped rather than the window being maximised, because a full-screen
+/// console for a search box is the thing being replaced here.
+///
+/// This works on the classic console host, which owns a real window we can
+/// restyle. Under a terminal that multiplexes tabs in its own process there is
+/// no such window, and `GetConsoleWindow` returns either nothing or a hidden
+/// stand-in; both cases are left alone rather than half-applied.
 #[cfg(windows)]
-pub fn maximize() {
+pub fn float() {
+    use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::System::Console::GetConsoleWindow;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_MAXIMIZE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, IsWindowVisible, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+        SystemParametersInfoW, GWL_STYLE, HWND_TOP, SPI_GETWORKAREA, SWP_FRAMECHANGED,
+        SWP_SHOWWINDOW, WS_BORDER, WS_CAPTION, WS_DLGFRAME, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+        WS_SYSMENU, WS_THICKFRAME,
+    };
 
     let hwnd = unsafe { GetConsoleWindow() };
-    if !hwnd.is_null() {
-        unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+    if hwnd.is_null() || unsafe { IsWindowVisible(hwnd) } == 0 {
+        return;
+    }
+
+    // Everything that makes a window look like a document window.
+    let chrome = (WS_CAPTION
+        | WS_THICKFRAME
+        | WS_MINIMIZEBOX
+        | WS_MAXIMIZEBOX
+        | WS_SYSMENU
+        | WS_BORDER
+        | WS_DLGFRAME) as isize;
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+    unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, style & !chrome) };
+
+    // The work area, not the screen: covering the taskbar would make the
+    // window hard to dismiss by anything but the keyboard.
+    let mut work = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            &mut work as *mut RECT as *mut core::ffi::c_void,
+            0,
+        )
+    };
+    if ok == 0 {
+        // Without a work area there is no sane size to pick, but the chrome is
+        // already gone; leave the window where it is rather than guessing.
+        return;
+    }
+
+    let (aw, ah) = (work.right - work.left, work.bottom - work.top);
+    let (w, h) = (aw * FLOAT_W / 100, ah * FLOAT_H / 100);
+    let x = work.left + (aw - w) / 2;
+    let y = work.top + (ah - h) / 2;
+
+    unsafe {
+        // SWP_FRAMECHANGED is required: without it the stripped styles are not
+        // recalculated and the old frame stays drawn.
+        SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            x,
+            y,
+            w,
+            h,
+            SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+        );
+        SetForegroundWindow(hwnd);
     }
 }
 
 #[cfg(not(windows))]
-pub fn maximize() {}
+pub fn float() {}
 
 #[cfg(test)]
 mod tests {
@@ -85,8 +158,9 @@ mod tests {
     }
 
     #[test]
-    fn maximizing_is_safe_without_a_console_window() {
-        // The hotkey helper runs detached with no console at all.
-        maximize();
+    fn floating_is_safe_without_a_console_window() {
+        // Runs under a test harness with no console of its own, which is the
+        // same path a terminal that owns no window takes.
+        float();
     }
 }

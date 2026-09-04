@@ -21,6 +21,8 @@ mod ui;
 
 pub use app::{App, Mode};
 
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -48,9 +50,46 @@ enum Source {
     Daemon(Box<PipeStream>),
     /// This process, answering from the last snapshot.
     Local {
-        index: Box<Index>,
+        /// Shared rather than owned, so a background scan can read it without
+        /// the UI thread having to hand it over or load it twice.
+        index: Arc<Index>,
         searcher: Searcher,
     },
+}
+
+/// Answers one request away from the UI thread.
+///
+/// Duplicate detection reads file contents and takes seconds. Doing that
+/// inline froze the whole interface — you could not switch modes, scroll, or
+/// even quit until it finished — so it is handed to a worker and collected
+/// when it is done.
+enum Worker {
+    Daemon,
+    Local(Arc<Index>),
+}
+
+impl Worker {
+    fn answer(&self, req: &Request) -> Response {
+        match self {
+            // The daemon already serves concurrent clients, so the scan opens
+            // its own connection instead of borrowing the UI's, which stays
+            // free to answer everything else meanwhile.
+            Worker::Daemon => match PipeStream::connect() {
+                Ok(mut s) => s.request(req).unwrap_or_else(|e| Response::Error {
+                    message: format!("daemon: {e}"),
+                }),
+                Err(e) => Response::Error {
+                    message: format!("daemon: {e}"),
+                },
+            },
+            Worker::Local(index) => query::execute(index, req, &mut Searcher::new(), false, 0),
+        }
+    }
+}
+
+/// A duplicate scan in flight.
+struct DupeJob {
+    rx: Receiver<Response>,
 }
 
 impl Source {
@@ -66,6 +105,26 @@ impl Source {
     fn is_live(&self) -> bool {
         matches!(self, Source::Daemon(_))
     }
+
+    /// A handle that can answer a request on another thread.
+    fn worker(&self) -> Worker {
+        match self {
+            Source::Daemon(_) => Worker::Daemon,
+            Source::Local { index, .. } => Worker::Local(Arc::clone(index)),
+        }
+    }
+}
+
+/// Start a duplicate scan in the background.
+fn spawn_dupes(backend: &Source, req: Request) -> DupeJob {
+    let worker = backend.worker();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver is dropped if the UI exits first; nothing to do but
+        // let the send fail and the thread end.
+        let _ = tx.send(worker.answer(&req));
+    });
+    DupeJob { rx }
 }
 
 /// Restores the terminal even if the UI panics.
@@ -96,10 +155,11 @@ pub fn run(cfg: &Config, source: scan::Source) -> Result<()> {
         "using cached index; run `batuta serve` for live sizes".into()
     };
 
-    // Opened by the hotkey we get a console of our own; use all of it. A
-    // terminal the user already had open is left at whatever size they chose.
+    // A console opened for us is ours to shape: the hotkey should produce a
+    // launcher panel, not a full-screen command window. A terminal the user
+    // already had open is left exactly as they arranged it.
     if crate::console::owns_console_alone() {
-        crate::console::maximize();
+        crate::console::float();
     }
 
     enable_raw_mode().context("entering raw mode")?;
@@ -119,7 +179,7 @@ pub fn run(cfg: &Config, source: scan::Source) -> Result<()> {
 fn local_source(cfg: &Config, source: scan::Source) -> Result<Source> {
     let built = scan::load_index(cfg, source)?;
     Ok(Source::Local {
-        index: Box::new(built.index),
+        index: Arc::new(built.index),
         searcher: Searcher::new(),
     })
 }
@@ -136,6 +196,11 @@ fn event_loop<B: Backend>(
         .unwrap_or(20);
     let mut last_input = Instant::now();
     let mut pending = true;
+    let mut dupe_job: Option<DupeJob> = None;
+    // How many rows the last fetch was sized for. Starts at a count no layout
+    // can produce, so it cannot match the first draw and the opening fetch is
+    // armed by the same rule that handles every later resize.
+    let mut fetched_for = usize::MAX;
 
     const DEBOUNCE: Duration = Duration::from_millis(30);
 
@@ -143,6 +208,34 @@ fn event_loop<B: Backend>(
         terminal.draw(|f| {
             visible = ui::draw(f, app);
         })?;
+
+        // A resize changes how many rows fit, but the fetch that ran before it
+        // asked for the old count. Left alone, a window that just got taller
+        // keeps showing the shorter list against a screenful of blank rows —
+        // the resize event arrives on the frame *before* the layout that
+        // reacts to it, so re-arming on the event itself is a frame too early.
+        if visible != fetched_for {
+            pending = true;
+        }
+
+        // Collect a finished scan. Never blocks: the point of the worker is
+        // that the interface keeps responding while it runs.
+        if let Some(job) = &dupe_job {
+            match job.rx.try_recv() {
+                Ok(response) => {
+                    apply_dupe_result(app, response, visible);
+                    dupe_job = None;
+                }
+                // The worker died without answering, which would otherwise
+                // leave the view scanning forever.
+                Err(TryRecvError::Disconnected) => {
+                    app.status = "the duplicate scan stopped unexpectedly".into();
+                    app.dupes_pending = false;
+                    dupe_job = None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
 
         // Wait for input, but never longer than the debounce window, so a
         // query that has settled still gets issued.
@@ -178,18 +271,52 @@ fn event_loop<B: Backend>(
         // Refresh only once typing has paused. Scrolling is served from the
         // previous ordering, so it does not wait on this.
         if (app.dirty || pending) && last_input.elapsed() >= DEBOUNCE {
-            refresh(app, backend, visible);
+            refresh(app, backend, visible, &mut dupe_job);
+            fetched_for = visible;
             pending = false;
         }
     }
 }
 
-fn refresh(app: &mut App, backend: &mut Source, visible: usize) {
+/// Fold a finished duplicate scan into the app.
+fn apply_dupe_result(app: &mut App, response: Response, visible: usize) {
+    match response {
+        Response::Dupes {
+            groups,
+            wasted_total,
+            elapsed_us,
+        } => {
+            app.apply_dupes(groups, wasted_total, elapsed_us, visible);
+            app.status.clear();
+        }
+        Response::Error { message } => {
+            // Leave the cache alone and stay armed, so F5 can retry.
+            app.status = message;
+            app.dupes_pending = true;
+        }
+        other => {
+            app.status = format!("unexpected response: {other:?}");
+            app.dupes_pending = true;
+        }
+    }
+}
+
+fn refresh(app: &mut App, backend: &mut Source, visible: usize, dupe_job: &mut Option<DupeJob>) {
     // A duplicate scan reads file contents and takes seconds, so it runs only
-    // when one is explicitly pending. Every other refresh in the mode —
-    // scrolling, re-entering it — is served by moving the window over the
-    // cache.
-    if app.mode == Mode::Dupes && !app.dupes_pending {
+    // when one is explicitly pending, and it runs on a worker: the UI thread
+    // must stay free to switch modes, scroll and quit while it works. Every
+    // other refresh in the mode — scrolling, re-entering it — is served by
+    // moving the window over the cache.
+    if app.mode == Mode::Dupes {
+        if app.dupes_pending {
+            if dupe_job.is_none() {
+                *dupe_job = Some(spawn_dupes(backend, app.request(visible)));
+            }
+            // Nothing more to do until the worker answers; leaving `dirty` set
+            // would spin this branch on every frame.
+            app.dirty = false;
+            return;
+        }
         app.window_dupes(visible);
         return;
     }
@@ -246,6 +373,14 @@ fn refresh(app: &mut App, backend: &mut Source, visible: usize) {
 
 fn handle_key(app: &mut App, key: KeyEvent, visible: usize) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    // The second half of a two-step Tab is only owed while Tab is what is
+    // being pressed. Any other key means the user moved on, and completing to
+    // a file they have since navigated away from would be baffling.
+    if key.code != KeyCode::Tab {
+        app.pending_file = None;
+    }
 
     // A confirmation prompt takes the keyboard entirely. Letting keys through
     // would mean typing into the query behind a dialog, or worse, having
@@ -303,11 +438,7 @@ fn handle_key(app: &mut App, key: KeyEvent, visible: usize) {
         // modes when there was nothing to complete, which meant a stray Tab
         // silently threw you into another view. Shift+Tab is the one key that
         // changes mode, so neither can be mistaken for the other.
-        KeyCode::Tab => {
-            if let Some(text) = app.complete_selection() {
-                app.set_query(&text);
-            }
-        }
+        KeyCode::Tab => app.complete(),
         KeyCode::BackTab => app.cycle_mode(),
 
         // Delete asks first; nothing is removed without an explicit answer.
@@ -330,6 +461,8 @@ fn handle_key(app: &mut App, key: KeyEvent, visible: usize) {
         // Opening a result finishes the job the window was opened for, so it
         // closes on the way out. A failed reveal leaves it up, because the
         // reason is on the status line and closing would hide it.
+        // Must precede the plain Enter arm, or the modifier is ignored.
+        KeyCode::Enter if shift => app.quit = open_selected(app),
         KeyCode::Enter => app.quit = reveal(app),
         _ => {}
     }
@@ -387,6 +520,78 @@ fn reveal_arg(path: &str) -> String {
     format!("/select,\"{target}\"")
 }
 
+/// Check the selected row still exists, returning its path.
+///
+/// The index can be ahead of the disk, and both Explorer and the shell fail
+/// the same silent way on a missing path — appearing to do nothing, or opening
+/// somewhere unexpected. Saying so is better than either.
+fn live_path(app: &mut App) -> Option<String> {
+    let path = app.current()?.path.clone();
+    if std::path::Path::new(&path).exists() {
+        return Some(path);
+    }
+    // A cached snapshot cannot know about a deletion, so say why nothing will
+    // correct itself rather than leaving the user wondering.
+    app.status = if app.live {
+        format!("no longer on disk: {path}")
+    } else {
+        format!(
+            "no longer on disk: {path} — the index is a snapshot; \
+             run `batuta scan` or `batuta serve` to refresh it"
+        )
+    };
+    None
+}
+
+/// Open the selected entry itself: a folder in Explorer, a file in whatever
+/// application owns it.
+///
+/// This is deliberately a different key from revealing it. Revealing answers
+/// "where is this", opening answers "let me have it", and guessing wrong in
+/// either direction is annoying in a way that a second binding is not.
+///
+/// Returns whether anything was launched, so the caller knows whether there is
+/// a message worth staying open to show.
+fn open_selected(app: &mut App) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    /// `ShellExecuteW` reports success as a value above this; below it the
+    /// return is a legacy `HINSTANCE`-shaped error code.
+    const SHELL_SUCCESS: isize = 32;
+
+    let Some(path) = live_path(app) else {
+        return false;
+    };
+
+    let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let target: Vec<u16> = std::ffi::OsStr::new(&path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let rc = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+
+    if rc > SHELL_SUCCESS {
+        true
+    } else {
+        // Most often a file type with nothing registered to open it.
+        app.status = format!("nothing is registered to open {path}");
+        false
+    }
+}
+
 /// Open Explorer with the selected entry highlighted.
 ///
 /// Launching a process is the one outward action the UI takes, and only ever
@@ -437,19 +642,122 @@ fn reveal(app: &mut App) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_key, refresh, reveal_arg, Source};
+    use super::{apply_dupe_result, handle_key, refresh, reveal_arg, Source};
     use crate::tui::app::{App, Kind, Sort};
     use batuta_core::search::Searcher;
     use batuta_core::testtree::TreeBuilder;
+    use batuta_ipc::{Response, Row};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// A local backend holding an (almost) empty index: enough to answer
     /// search requests, no pipe, no elevation.
     fn local_backend() -> Source {
         Source::Local {
-            index: Box::new(TreeBuilder::new('C').build()),
+            index: std::sync::Arc::new(TreeBuilder::new('C').build()),
             searcher: Searcher::new(),
         }
+    }
+
+    #[test]
+    fn a_duplicate_scan_never_blocks_the_interface() {
+        // Before this moved to a worker, refresh sat inside the scan and the
+        // whole UI froze: no mode switch, no scrolling, no quitting until it
+        // finished.
+        let mut backend = local_backend();
+        let mut app = App::new(false);
+        app.mode = crate::tui::Mode::Dupes;
+        app.dupes_pending = true;
+
+        let mut job = None;
+        refresh(&mut app, &mut backend, 10, &mut job);
+
+        assert!(job.is_some(), "the scan should have gone to a worker");
+        assert!(
+            !app.dirty,
+            "leaving this set would respin the branch every frame"
+        );
+
+        // The proof that matters: the interface still takes input.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+            10,
+        );
+        assert_ne!(
+            app.mode,
+            crate::tui::Mode::Dupes,
+            "modes must switch during a scan"
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            10,
+        );
+        assert!(app.quit, "quitting must not wait for the scan either");
+    }
+
+    #[test]
+    fn a_scan_already_running_is_not_started_a_second_time() {
+        let mut backend = local_backend();
+        let mut app = App::new(false);
+        app.mode = crate::tui::Mode::Dupes;
+        app.dupes_pending = true;
+
+        let mut job = None;
+        refresh(&mut app, &mut backend, 10, &mut job);
+        assert!(job.is_some());
+
+        // Re-entering the view, or any other refresh, must not pile up a
+        // second scan over the same files.
+        app.dirty = true;
+        refresh(&mut app, &mut backend, 10, &mut job);
+        assert!(job.is_some());
+    }
+
+    #[test]
+    fn a_finished_scan_that_failed_stays_armed_for_a_retry() {
+        let mut app = App::new(false);
+        app.mode = crate::tui::Mode::Dupes;
+        app.dupes_pending = true;
+
+        apply_dupe_result(
+            &mut app,
+            Response::Error {
+                message: "disk went away".into(),
+            },
+            10,
+        );
+
+        assert_eq!(app.status, "disk went away");
+        assert!(app.dupes_pending, "F5 must still be able to retry");
+    }
+
+    #[test]
+    fn moving_off_a_row_cancels_the_second_half_of_a_tab() {
+        let mut app = App::default();
+        typed(&mut app, "file");
+        app.apply_rows(
+            vec![Row {
+                path: r"C:\data\file_0001.bin".into(),
+                size: 1,
+                mtime: 0,
+                is_dir: false,
+                files: 0,
+                own: 0,
+            }],
+            1,
+            0,
+            10,
+        );
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.query, r"C:\data\", "first Tab steps into the directory");
+        assert!(app.pending_file.is_some(), "the file is owed a second Tab");
+
+        // Any other key means the user moved on, and completing later to a
+        // file they have since navigated away from would be baffling.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.pending_file, None, "the second step must not survive");
     }
 
     fn press(app: &mut App, code: KeyCode) {
@@ -522,7 +830,7 @@ mod tests {
         let mut app = App::default();
         assert!(app.dupes_pending, "the first entry into dupes must scan");
         ctrl(&mut app, 'd');
-        assert_eq!(app.mode, crate::tui::app::Mode::Dupes);
+        assert_eq!(app.mode, crate::tui::Mode::Dupes);
         assert!(
             app.status.contains("scanning for duplicates"),
             "the blocking scan must be announced: {}",
@@ -536,7 +844,7 @@ mod tests {
         ctrl(&mut app, 'd');
         assert_eq!(app.mode, crate::tui::app::Mode::Search);
         ctrl(&mut app, 'd');
-        assert_eq!(app.mode, crate::tui::app::Mode::Dupes);
+        assert_eq!(app.mode, crate::tui::Mode::Dupes);
         assert!(
             !app.dupes_pending,
             "a cached result must not re-hash every file"
@@ -587,7 +895,7 @@ mod tests {
         assert_eq!(app.query, r"C:\Users\Hacker\");
 
         // Shift+Tab is the always-works mode key, even mid-drill-down.
-        app.mode = crate::tui::app::Mode::Dupes;
+        app.mode = crate::tui::Mode::Dupes;
         press(&mut app, KeyCode::BackTab);
         assert_eq!(
             app.mode,
@@ -610,12 +918,12 @@ mod tests {
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.mode, before, "Tab must not change mode");
 
-        // A plain name search has no completion to offer, and still must not
-        // become a mode switch.
+        // With nothing highlighted there is nothing to complete to, so the
+        // query is left exactly as typed — and Tab still is not a mode key.
         let mut app = App::default();
         typed(&mut app, "report");
         press(&mut app, KeyCode::Tab);
-        assert_eq!(app.query, "report", "a name search must not become a path");
+        assert_eq!(app.query, "report", "nothing was highlighted to complete");
         assert_eq!(app.mode, before, "Tab must not change mode");
     }
 
@@ -715,7 +1023,7 @@ mod tests {
 
         // The settle-refresh Enter armed: same query, nothing dirty.
         let mut backend = local_backend();
-        refresh(&mut app, &mut backend, 10);
+        refresh(&mut app, &mut backend, 10, &mut None);
         assert!(
             app.status.contains("no longer on disk"),
             "the settle must not erase the message: {}",
@@ -724,7 +1032,7 @@ mod tests {
 
         // A change of state — typing — is the user moving on, and that clears.
         typed(&mut app, "x");
-        refresh(&mut app, &mut backend, 10);
+        refresh(&mut app, &mut backend, 10, &mut None);
         assert!(app.status.is_empty(), "{}", app.status);
     }
 
