@@ -17,6 +17,7 @@
 pub(crate) mod app;
 pub(crate) mod explorer;
 pub(crate) mod layout;
+pub(crate) mod terminal;
 pub(crate) mod theme;
 mod ui;
 
@@ -567,6 +568,11 @@ fn explorer_key(app: &mut App, key: KeyEvent, visible: usize) {
 
     match action {
         Action::None => {}
+        Action::Complete => {
+            if let Some(x) = &mut app.explorer {
+                x.complete_path(&Disk);
+            }
+        }
         Action::Save => {
             if let Some(x) = &mut app.explorer {
                 app.status = x.save();

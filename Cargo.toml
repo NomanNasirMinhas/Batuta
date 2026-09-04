@@ -30,6 +30,12 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 bytemuck = "1"
 ratatui = "0.29"
+# Alacritty's VT state machine. The escape-sequence parser is the part of a
+# terminal most likely to be subtly wrong, and this one is exhaustively tested.
+vte = "0.15"
+# ConPTY sequencing, for the same reason as vte: the hand-rolled version
+# had every documented precondition right and still would not attach.
+portable-pty = "0.9"
 
 [profile.release]
 opt-level = 3

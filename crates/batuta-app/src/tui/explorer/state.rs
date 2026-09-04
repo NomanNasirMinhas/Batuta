@@ -67,6 +67,9 @@ pub enum Action {
     /// Load this file, discarding whatever is open.
     Open(PathBuf),
     Save,
+    /// Complete the path bar. Handled by the caller because it needs a
+    /// directory listing, which is the caller's to supply.
+    Complete,
 }
 
 pub struct Explorer {
@@ -253,6 +256,46 @@ impl Explorer {
         }
     }
 
+    /// Complete the path bar against what is really on disk.
+    ///
+    /// A directory gains a trailing separator so the next Tab carries on
+    /// inside it, which is what makes drilling down feel continuous.
+    pub fn complete_path(&mut self, lister: &dyn Lister) {
+        let text = self.path_text.trim_end().to_string();
+        let Some((dir, partial)) = split_for_completion(&text) else {
+            return;
+        };
+        let Ok(entries) = lister.list(Path::new(dir)) else {
+            return;
+        };
+
+        let wanted = partial.to_ascii_lowercase();
+        let hits: Vec<&super::tree::Entry> = entries
+            .iter()
+            .filter(|e| e.name.to_ascii_lowercase().starts_with(&wanted))
+            .collect();
+        if hits.is_empty() {
+            return;
+        }
+
+        let names: Vec<String> = hits.iter().map(|e| e.name.clone()).collect();
+        let completed = common_prefix(&names);
+        if completed.len() < partial.len() {
+            return;
+        }
+
+        let sep = if dir.ends_with(['\\', '/']) { "" } else { "\\" };
+        let mut out = format!("{dir}{sep}{completed}");
+        // Only when it is unambiguous: appending a separator to a shared
+        // prefix would claim a directory exists that does not.
+        if hits.len() == 1 && hits[0].is_dir && hits[0].name == completed {
+            out.push('\\');
+        }
+
+        self.path_text = out;
+        self.path_caret = self.path_text.chars().count();
+    }
+
     /// Back out of the path bar. Above the other two panes there is nothing,
     /// so this only does something from there.
     fn cross_up(&mut self) {
@@ -405,6 +448,7 @@ impl Explorer {
                 self.path_text.insert(at, c);
                 self.path_caret += 1;
             }
+            KeyCode::Tab => return Action::Complete,
             KeyCode::Enter => {
                 let path = PathBuf::from(self.path_text.trim());
                 if path.is_dir() {
@@ -420,6 +464,40 @@ impl Explorer {
         }
         Action::None
     }
+}
+
+/// Split path text into the directory to list and the part still being typed.
+///
+/// Returns `None` when there is no separator yet, because "list everything on
+/// every drive" is not a useful completion.
+fn split_for_completion(text: &str) -> Option<(&str, &str)> {
+    let (dir, partial) = text.rsplit_once(['\\', '/'])?;
+    // `C:\foo` splits to ("C:", "foo"), and `C:` alone names the drive's
+    // current directory rather than its root - so it is put back.
+    Some((if dir.is_empty() { "\\" } else { dir }, partial))
+}
+
+/// The longest prefix every candidate shares, from `partial` onwards.
+///
+/// Completing to the common prefix rather than to the first match is what
+/// makes repeated Tab useful: each press gets you as far as the names agree,
+/// and stops where a choice actually has to be made.
+fn common_prefix(names: &[String]) -> String {
+    let Some(first) = names.first() else {
+        return String::new();
+    };
+    let mut end = first.len();
+    for other in &names[1..] {
+        let shared = first
+            .char_indices()
+            .zip(other.chars())
+            .take_while(|((_, a), b)| a.eq_ignore_ascii_case(b))
+            .last()
+            .map(|((i, a), _)| i + a.len_utf8())
+            .unwrap_or(0);
+        end = end.min(shared);
+    }
+    first[..end].to_string()
 }
 
 /// Byte offset of character `n`, saturating at the end.
@@ -721,6 +799,86 @@ mod tests {
             "caret at {line} outside window starting {}",
             x.top_line
         );
+    }
+
+    #[test]
+    fn tab_completes_a_unique_directory_and_opens_it_for_more() {
+        let fs = Fake::new(&[(r"C:\p", &[("Downloads", true), ("Music", true)])]);
+        let mut x = Explorer::new(r"C:\p".into());
+        x.path_text = r"C:\p\Dow".into();
+
+        x.complete_path(&fs);
+        assert_eq!(
+            x.path_text, r"C:\p\Downloads\",
+            "a directory ends ready to keep going"
+        );
+        assert_eq!(x.path_caret, x.path_text.chars().count());
+    }
+
+    #[test]
+    fn tab_completes_a_file_without_a_trailing_separator() {
+        let fs = Fake::new(&[(r"C:\p", &[("notes.txt", false)])]);
+        let mut x = Explorer::new(r"C:\p".into());
+        x.path_text = r"C:\p\not".into();
+        x.complete_path(&fs);
+        assert_eq!(x.path_text, r"C:\p\notes.txt");
+    }
+
+    #[test]
+    fn tab_stops_where_the_names_stop_agreeing() {
+        // Completing to the first match would silently pick one of several.
+        // Going as far as they agree stops exactly where a choice is needed.
+        let fs = Fake::new(&[(
+            r"C:\p",
+            &[("report-jan.txt", false), ("report-feb.txt", false)],
+        )]);
+        let mut x = Explorer::new(r"C:\p".into());
+        x.path_text = r"C:\p\rep".into();
+
+        x.complete_path(&fs);
+        assert_eq!(x.path_text, r"C:\p\report-");
+        assert!(
+            !x.path_text.ends_with('\\'),
+            "a shared prefix is not a directory that exists"
+        );
+    }
+
+    #[test]
+    fn tab_matches_regardless_of_case() {
+        let fs = Fake::new(&[(r"C:\p", &[("Downloads", true)])]);
+        let mut x = Explorer::new(r"C:\p".into());
+        x.path_text = r"C:\p\dOwN".into();
+        x.complete_path(&fs);
+        assert_eq!(x.path_text, r"C:\p\Downloads\");
+    }
+
+    #[test]
+    fn tab_with_nothing_matching_leaves_the_text_alone() {
+        let fs = Fake::new(&[(r"C:\p", &[("Music", true)])]);
+        let mut x = Explorer::new(r"C:\p".into());
+        x.path_text = r"C:\p\zzz".into();
+        x.complete_path(&fs);
+        assert_eq!(x.path_text, r"C:\p\zzz", "nothing to say, so say nothing");
+    }
+
+    #[test]
+    fn tab_on_a_bare_word_does_nothing() {
+        // Without a separator there is no directory to list, and completing
+        // against every drive is not a useful answer.
+        let fs = Fake::new(&[(r"C:\p", &[("Music", true)])]);
+        let mut x = Explorer::new(r"C:\p".into());
+        x.path_text = "Mus".into();
+        x.complete_path(&fs);
+        assert_eq!(x.path_text, "Mus");
+    }
+
+    #[test]
+    fn tab_after_a_separator_lists_the_directory_itself() {
+        let fs = Fake::new(&[(r"C:\p", &[("only", true)])]);
+        let mut x = Explorer::new(r"C:\p".into());
+        x.path_text = r"C:\p\".into();
+        x.complete_path(&fs);
+        assert_eq!(x.path_text, r"C:\p\only\");
     }
 
     #[test]
