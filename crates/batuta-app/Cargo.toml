@@ -17,6 +17,7 @@ serde.workspace = true
 toml.workspace = true
 anyhow = "1"
 blake3.workspace = true
+memchr.workspace = true
 batuta-ipc = { path = "../batuta-ipc" }
 parking_lot.workspace = true
 ratatui.workspace = true

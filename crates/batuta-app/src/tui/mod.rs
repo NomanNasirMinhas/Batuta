@@ -15,6 +15,7 @@
 //!   previous result set instead of rescanning the name arena.
 
 pub(crate) mod app;
+pub(crate) mod explorer;
 pub(crate) mod layout;
 pub(crate) mod theme;
 mod ui;
@@ -127,7 +128,33 @@ fn spawn_dupes(backend: &Source, req: Request) -> DupeJob {
     DupeJob { rx }
 }
 
-/// Restores the terminal even if the UI panics.
+/// Put the terminal back before a panic takes the process down.
+///
+/// The guard below handles every ordinary exit. It does **not** handle a
+/// panic: the release profile sets `panic = "abort"`, so there is no
+/// unwinding and no destructor runs. The process dies with raw mode still on
+/// and the alternate screen still up, leaving the shell unusable and the
+/// panic message hidden behind a screen that is never restored — which is
+/// exactly when you most need to read it.
+///
+/// A hook is the one piece of cleanup that does run, because it runs *before*
+/// the abort rather than during an unwind.
+fn install_panic_hook() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            previous(info);
+        }));
+    });
+}
+
+/// Restores the terminal on every ordinary exit. See [`install_panic_hook`]
+/// for the case this cannot cover.
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -162,6 +189,7 @@ pub fn run(cfg: &Config, source: scan::Source) -> Result<()> {
         crate::console::float();
     }
 
+    install_panic_hook();
     enable_raw_mode().context("entering raw mode")?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("entering alt screen")?;
