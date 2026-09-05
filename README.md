@@ -436,12 +436,63 @@ locally; the CLI's `batuta dupes` still runs standalone against the snapshot.
 drives = ["C", "D"]
 exclude = ['C:\Windows', 'C:\Program Files', 'C:\Program Files (x86)']
 include_metadata = false
+check_updates = true
 ```
+
+`check_updates` is the only setting that reaches the network; see
+[Update check](#update-check). A config written before it existed keeps the
+check on, and re-running setup leaves it however you set it.
 
 Exclusions are applied *after* the MFT is read, as a subtree prune. Reading the
 MFT is one sequential pass regardless of what is kept, so skipping `C:\Windows`
 would save nothing at scan time — and pruning afterwards means changing these
 settings never requires a rescan.
+
+## Update check
+
+Batuta says so, as text, when a newer release has been published — in the
+status line of the UI and on the first line of `batuta status`:
+
+```
+version        v0.1.3  (v0.1.4 available)
+```
+
+It is a sentence and nothing else. Batuta does not download the release, does
+not run anything, and has no self-update path. Upgrading is deliberately still
+your decision and your `git pull` or your download.
+
+**This is the only thing Batuta does that leaves the machine.** One GET to
+`github.com`, carrying a user agent naming the program and its version, at most
+once a day, remembered under `%LOCALAPPDATA%\Batuta`. Nothing about the index,
+the machine or the user is sent — there is nothing to send, because the answer
+does not depend on who is asking. Turn it off with `check_updates = false` in
+the config, or `BATUTA_NO_UPDATE_CHECK=1` in the environment. The daemon never
+checks: it runs as LocalSystem and has nobody to tell.
+
+`https://github.com/OWNER/REPO/releases/latest` is a redirect to the newest
+release's tag page, so the answer is the `Location` header. That means no JSON
+to parse, no API rate limit, and no dependency: WinHTTP is already in the
+Windows the rest of the program is written against, so adding an HTTP client
+and a TLS stack for one request would have been the larger change. Redirects
+are switched off, because the redirect is the answer.
+
+The check is started before the interface takes over the screen and collected
+whenever it finishes, on the same never-blocking rule as the duplicate scan. A
+failed check — no network, GitHub unreachable, an answer that did not parse —
+shows nothing at all. Not being able to check for updates is not a problem the
+user has, and reporting it as one on every launch would be.
+
+### Which version is running
+
+The version comes from the tag the release workflow published, stamped into
+the build as `BATUTA_VERSION`, because the workflow derives the version from
+the published tags rather than from `Cargo.toml` — so the manifest alone could
+never tell the binary what it is. `--version` and the update check read the
+same stamp, so they cannot disagree.
+
+A locally built binary has no stamp and reports what `Cargo.toml` says, which
+is the truthful answer for a build that is not a release: between releases it
+will say a newer version is available, and it is right.
 
 ## Design
 

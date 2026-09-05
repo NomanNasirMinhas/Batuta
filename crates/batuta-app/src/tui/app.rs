@@ -215,12 +215,16 @@ pub struct App {
     /// Answers are coming from a live daemon rather than a snapshot.
     pub live: bool,
     pub status: String,
+    /// A newer release exists, once the background check has said so. Shown as
+    /// text and nothing more: Batuta does not download or install anything.
+    pub update: Option<crate::update::Version>,
 }
 
 impl Default for App {
     fn default() -> Self {
         App {
             mode: Mode::Search,
+            update: None,
             query: String::new(),
             sort: Sort::Name,
             kind: Kind::All,

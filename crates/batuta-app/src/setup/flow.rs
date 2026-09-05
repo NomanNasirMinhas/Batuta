@@ -61,6 +61,10 @@ impl SetupPlan {
             owner_sid: base.owner_sid.clone(),
             keep_in_ram: self.keep_in_ram,
             restrict_index: self.restrict_index,
+            // Not one of the setup questions. It is carried through from
+            // whatever was already configured, so re-running setup cannot
+            // quietly switch it back on for somebody who turned it off.
+            check_updates: base.check_updates,
         }
     }
 

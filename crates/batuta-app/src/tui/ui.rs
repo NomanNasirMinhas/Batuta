@@ -1430,6 +1430,18 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    // Appended after whichever branch above ran, so it shows in every mode and
+    // alongside a status message rather than being replaced by one. Worth
+    // saying, not worth interrupting anyone over: it is the same weight as the
+    // counters beside it, and it names the version so the reader can decide
+    // whether they care.
+    if let Some(version) = app.update {
+        left.push(Span::styled(
+            format!("  ·  {version} available"),
+            Style::default().fg(theme().warn()),
+        ));
+    }
+
     let state = format!("sort:{}  show:{}", app.sort.label(), app.kind.label());
     let full = format!("{state}  │ Tab complete  Shift+Tab modes  Ctrl+S sort  Ctrl+T filter  Ctrl+B rail  Ctrl+D dupes  Ctrl+E explore  Enter reveal  Shift+Enter open  Esc close");
     // Two middle tiers, so the hints thin out a rung at a time rather than
@@ -1551,6 +1563,58 @@ mod tests {
             // column header.
             let expected = panes.results.height.saturating_sub(3) as usize;
             assert_eq!(visible, expected, "wrong visible count at height {height}");
+        }
+    }
+
+    #[test]
+    fn an_available_update_is_named_in_the_status_line() {
+        let mut app = App {
+            total: 3,
+            ..Default::default()
+        };
+        app.update = Some(crate::update::Version {
+            major: 0,
+            minor: 2,
+            patch: 0,
+        });
+        let (screen, _) = render(&app, 160, 20);
+        assert!(
+            screen.contains("v0.2.0 available"),
+            "the version has to be named, not just hinted at:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_said_when_there_is_no_update() {
+        // The check failing, or finding nothing, must look exactly like the
+        // feature not existing. A "checking..." or "up to date" line would be
+        // noise on every launch forever.
+        let app = App {
+            total: 3,
+            ..Default::default()
+        };
+        let (screen, _) = render(&app, 160, 20);
+        assert!(!screen.contains("available"), "{screen}");
+    }
+
+    #[test]
+    fn the_update_survives_a_status_message_and_every_mode() {
+        // It is appended after the branch that builds the counters, so a
+        // status message must not replace it and Dupes must not lose it.
+        for mode in [Mode::Search, Mode::Bloat, Mode::Dupes] {
+            let mut app = App {
+                mode,
+                total: 3,
+                status: "connected to daemon (live index)".into(),
+                ..Default::default()
+            };
+            app.update = Some(crate::update::Version {
+                major: 9,
+                minor: 9,
+                patch: 9,
+            });
+            let (screen, _) = render(&app, 160, 20);
+            assert!(screen.contains("v9.9.9 available"), "{mode:?}:\n{screen}");
         }
     }
 

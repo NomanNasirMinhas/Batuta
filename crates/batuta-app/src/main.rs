@@ -14,6 +14,7 @@ mod service;
 mod setup;
 mod shell;
 mod tui;
+mod update;
 mod watcher;
 
 use anyhow::{bail, Context, Result};
@@ -31,7 +32,10 @@ use setup::prompt::Ask;
 #[command(
     name = "batuta",
     about = "Real-time NTFS file index: instant search, live folder sizes, duplicate detection",
-    version
+    // The released version comes from the tag the workflow published, not from
+    // Cargo.toml, so `--version` has to read the same stamp the update check
+    // compares against. Otherwise the two would disagree about what is running.
+    version = update::stamped()
 )]
 struct Cli {
     /// Path to the config file.
@@ -443,6 +447,14 @@ fn report_scan(cfg: &Config, built: &scan::BuiltIndex) {
 }
 
 fn do_status(cfg: &Config, fresh: bool) -> Result<()> {
+    print!("version        {}", update::stamped());
+    // Inline rather than on a thread: `status` exists to be read, and it is
+    // already waiting on the daemon. The request is bounded by its own
+    // timeouts, and a day-old answer is reused rather than asked again.
+    match update::check(cfg.check_updates) {
+        Some(latest) => println!("  ({latest} available)"),
+        None => println!(),
+    }
     println!(
         "elevated       {}",
         if batuta_ntfs::is_elevated() {

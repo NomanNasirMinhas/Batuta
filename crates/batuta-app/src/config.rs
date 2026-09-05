@@ -38,6 +38,14 @@ pub struct Config {
     /// few megabytes resident and costs a slower first query afterwards, while
     /// the pages fault back in.
     pub keep_in_ram: bool,
+    /// Ask GitHub once a day whether a newer release has been published, and
+    /// say so in the interface.
+    ///
+    /// The one thing Batuta does that leaves the machine, so it is a setting
+    /// rather than a fact. Nothing is sent but a request for a public page,
+    /// and nothing is ever downloaded or run.
+    #[serde(default = "yes")]
+    pub check_updates: bool,
     /// SID of the account that ran setup.
     ///
     /// The daemon runs as LocalSystem, so it cannot work out who the human
@@ -51,6 +59,10 @@ pub struct Config {
     /// The index describes every file belonging to every user, and
     /// `%ProgramData%` is readable by all local accounts by default.
     pub restrict_index: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// `%ProgramData%\Batuta`, or the current directory if that is unavailable.
@@ -76,6 +88,7 @@ impl Default for Config {
             install_dir: root.join("bin"),
             hotkey: None,
             keep_in_ram: true,
+            check_updates: true,
             owner_sid: None,
             restrict_index: false,
         }
@@ -197,5 +210,73 @@ mod tests {
         };
         assert_ne!(a.snapshot_path(), b.snapshot_path());
         assert!(b.snapshot_path().starts_with(r"D:\Elsewhere"));
+    }
+}
+
+#[cfg(test)]
+mod update_setting_tests {
+    use super::*;
+
+    /// A config with every key that existed before `check_updates` did.
+    /// Forward slashes because TOML reads a backslash as an escape, which is
+    /// its own trap and not the one being tested here.
+    const OLDER: &str = r#"
+drives = ["C"]
+exclude = []
+include_metadata = false
+data_dir = "C:/ProgramData/Batuta"
+install_dir = "C:/ProgramData/Batuta/bin"
+keep_in_ram = true
+restrict_index = false
+"#;
+
+    #[test]
+    fn a_config_written_before_the_setting_existed_keeps_the_check_on() {
+        // Without a default, serde would refuse the file outright — turning an
+        // upgrade into a program that will not start.
+        let cfg: Config = toml::from_str(OLDER).expect("an older config still loads");
+        assert!(cfg.check_updates, "the default has to survive its absence");
+    }
+
+    #[test]
+    fn the_setting_is_honoured_when_present() {
+        let cfg: Config =
+            toml::from_str(&format!("{OLDER}check_updates = false\n")).expect("loads");
+        assert!(!cfg.check_updates);
+    }
+
+    #[test]
+    fn the_setting_survives_a_write_and_a_read() {
+        let cfg = Config {
+            check_updates: false,
+            ..Default::default()
+        };
+        let text = toml::to_string(&cfg).expect("serialises");
+        let back: Config = toml::from_str(&text).expect("round trips");
+        assert!(!back.check_updates);
+    }
+
+    #[test]
+    fn re_running_setup_does_not_switch_the_check_back_on() {
+        // It is not one of the setup questions, so it has to be carried
+        // through from whatever was already configured rather than defaulted.
+        let mut base = Config {
+            check_updates: false,
+            ..Default::default()
+        };
+        let plan = crate::setup::flow::SetupPlan {
+            resident: crate::setup::flow::Resident::Manual,
+            drives: vec!['C'],
+            exclude_system: true,
+            install_dir: base.install_dir.clone(),
+            data_dir: base.data_dir.clone(),
+            restrict_index: false,
+            keep_in_ram: true,
+            hotkey: None,
+            add_to_path: false,
+        };
+        assert!(!plan.to_config(&base).check_updates);
+        base.check_updates = true;
+        assert!(plan.to_config(&base).check_updates);
     }
 }

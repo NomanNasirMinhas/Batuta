@@ -88,6 +88,11 @@ jobs:
           Write-Host "publishing $v"
 
       - name: Build
+        # The version is worked out from the tags, not from Cargo.toml, so
+        # without stamping it the published exe would report whatever the
+        # manifest happened to say and could never tell it was out of date.
+        env:
+          BATUTA_VERSION: ${{ steps.version.outputs.version }}
         run: cargo build --release
 
       - name: Stage artefacts

@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.3"
 edition = "2021"
 # Verified by building on it. The floor comes from the dependency tree
 # (ratatui pulls in crates requiring 1.88), not from this code.

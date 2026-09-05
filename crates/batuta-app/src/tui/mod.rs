@@ -195,6 +195,10 @@ pub fn run(cfg: &Config, source: scan::Source) -> Result<()> {
         crate::console::float();
     }
 
+    // Started before the screen is taken over, so the first frame is not
+    // waiting on a network request. The answer is collected in the loop.
+    let updates = crate::update::spawn(cfg.check_updates);
+
     install_panic_hook();
     enable_raw_mode().context("entering raw mode")?;
     let mut stdout = std::io::stdout();
@@ -202,7 +206,7 @@ pub fn run(cfg: &Config, source: scan::Source) -> Result<()> {
     let _guard = TerminalGuard;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = event_loop(&mut terminal, &mut app, &mut backend);
+    let result = event_loop(&mut terminal, &mut app, &mut backend, updates);
 
     // The guard restores the terminal; surface any UI error afterwards.
     drop(_guard);
@@ -222,6 +226,7 @@ fn event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     backend: &mut Source,
+    updates: Receiver<Option<crate::update::Version>>,
 ) -> Result<()> {
     // Rows available for results, learned from the first draw.
     let mut visible = terminal
@@ -272,6 +277,13 @@ fn event_loop<B: Backend>(
         // reacts to it, so re-arming on the event itself is a frame too early.
         if visible != fetched_for {
             pending = true;
+        }
+
+        // Whatever the update check found, if it has finished. A check that
+        // never answers, or answers that there is nothing to say, leaves this
+        // as it was and shows nothing.
+        if let Ok(Some(version)) = updates.try_recv() {
+            app.update = Some(version);
         }
 
         // Collect a finished scan. Never blocks: the point of the worker is
