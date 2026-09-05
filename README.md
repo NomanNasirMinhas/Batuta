@@ -87,7 +87,7 @@ go.
 | `Ctrl+B` | show or hide the rail |
 | `Ctrl+D` | jump straight to duplicates (and back) |
 | `Ctrl+E` | open the explorer on the highlighted entry |
-| `Ctrl+C` | open a shell in the highlighted folder |
+| `Ctrl+C` | open a terminal in the highlighted folder |
 | `Ctrl+Q` | quit |
 | `Enter` | reveal the selected entry in Explorer, and close |
 | `Shift+Enter` | open it: a folder in Explorer, a file in its own application |
@@ -155,8 +155,8 @@ hands the file to another program.
 
 It is deliberately **not** in the `Shift+Tab` cycle. Cycling into an editor by
 accident, or out of one holding unsaved changes, is a trap, and `Shift+Tab`
-means outdent in every editor anyone has used. `Ctrl+E` goes in, `Esc` comes
-back.
+means outdent in every editor anyone has used. `Ctrl+E` goes in and `Ctrl+E`
+comes back: the key that opened a view is the key that leaves it.
 
 The explorer owns its keyboard outright rather than sharing the search view's.
 That is not tidiness: out there `Delete` removes the highlighted **file from
@@ -230,10 +230,47 @@ interpreter behind it — not a box that runs a command and prints the output. S
 `git`, `cargo` and `npm` work, and so do the full-screen programs: colours,
 cursor movement, scroll regions and the alternate screen are all handled.
 
-That choice answers three things by not doing them. Tab completion in the
-terminal is **PowerShell's**, and intercepting Tab would break it. Command
-history is PowerShell's too — `Up` already works. And `Esc` is forwarded rather
-than swallowed, because that is how anyone leaves insert mode in `vim`.
+`Esc` is forwarded rather than swallowed, because that is how anyone leaves
+insert mode in `vim`.
+
+### The shell it runs
+
+The terminal does not open PowerShell. It runs **Batuta's own shell** — the
+`batuta shell` subcommand, the same binary talking to itself through the
+pseudo-console.
+
+It is a small shell on purpose. It has:
+
+- **Builtins** that need to change the shell itself, or that Windows has no
+  program for: `cd` (with `cd -`), `pwd`, `ls`/`dir`, `cat`/`type`, `echo`,
+  `mkdir`, `touch`, `cp`/`copy`, `mv`/`move`, `rm`/`del`, `which`, `set`,
+  `clear`/`cls`, `help`, `exit`. Both spellings because both get typed.
+  `rm`, `cp` and `mv` handle files only — a mistyped name that quietly
+  duplicates or deletes a whole tree is not worth the convenience.
+- **External programs**, found on `PATH` with `PATHEXT` applied and the current
+  directory tried first, so `git`, `cargo` and `npm` work unchanged.
+- **Pipes and redirection**: `a | b | c`, `> file`, `>> file`, `< file`,
+  `2> file`, `2>&1`. Builtins take part in pipelines like anything else —
+  `echo hi | cat` runs both in-process.
+- **Quoting and expansion**: single and double quotes, `$VAR`, `${VAR}`,
+  `%VAR%` and a leading `~`. A `$` inside single quotes survives, because that
+  is the one place it must.
+- **Line editing** it owns: `Left`/`Right`/`Home`/`End`, `Ctrl+U`, `Ctrl+W`,
+  `Ctrl+L`, `Ctrl+C` to abandon a line, `Ctrl+D` to leave.
+- **History** on `Up`/`Down`, which keeps the half-typed line you were on when
+  you started walking back, ignores blanks and immediate repeats, and stops at
+  1000 entries.
+- **Tab completion** against the real filesystem, relative to the shell's
+  directory rather than the process's — completing to the longest common
+  prefix, and adding a separator when the single match is a directory.
+
+What it deliberately does not have: control flow, functions, globbing,
+subshells. This is a shell for running a few commands in a folder you just
+found, not a language. PowerShell already exists and is better at being one —
+and `powershell` is still one word away.
+
+Setting `BATUTA_SHELL` overrides the choice entirely, for anyone who wants
+their own.
 
 `Ctrl+C` had to move for this. Inside a terminal it means *interrupt what is
 running*, which is the one binding it would be perverse to take from someone,

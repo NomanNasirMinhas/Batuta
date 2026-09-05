@@ -39,18 +39,46 @@ pub struct Pty {
     pub output: Receiver<Chunk>,
 }
 
-/// The shell to run.
+/// The program to run, and its arguments.
 ///
-/// `BATUTA_SHELL` wins, otherwise PowerShell. "Open a terminal here" should
-/// give you the shell you actually use, and on Windows 10 and 11 that is
-/// overwhelmingly PowerShell rather than `cmd`.
-fn shell_command() -> String {
-    std::env::var("BATUTA_SHELL").unwrap_or_else(|_| "powershell.exe".to_string())
+/// Batuta's own shell by default: `batuta shell` is a hidden subcommand that
+/// is a full command interpreter. Running it *inside* the pseudo-console
+/// rather than in-process is what keeps interactive programs working —
+/// anything it launches inherits a real console, so `vim` behaves as `vim`
+/// should.
+///
+/// Returned split rather than as one string because the program and its
+/// arguments are separate things to `CommandBuilder`; joining them would make
+/// it look for a file whose name contains a space and an argument.
+///
+/// `BATUTA_SHELL` overrides, for anyone who would rather have PowerShell.
+pub fn shell_command() -> (String, Vec<String>) {
+    if let Ok(custom) = std::env::var("BATUTA_SHELL") {
+        let mut parts = custom.split_whitespace().map(str::to_string);
+        if let Some(program) = parts.next() {
+            return (program, parts.collect());
+        }
+    }
+    match std::env::current_exe() {
+        Ok(exe) => (exe.display().to_string(), vec!["shell".to_string()]),
+        Err(_) => ("powershell.exe".to_string(), Vec::new()),
+    }
 }
 
 impl Pty {
-    /// Start a shell in `cwd`, sized `cols` by `rows`.
-    pub fn spawn(cwd: &std::path::Path, cols: u16, rows: u16) -> anyhow::Result<Pty> {
+    /// Start a named program in `cwd`, sized `cols` by `rows`.
+    ///
+    /// Taking the program rather than always resolving it is what lets the
+    /// tests drive a known, fast one: under `cargo test` the running
+    /// executable is the test binary, so the default would try to run the
+    /// harness as a shell.
+    pub fn spawn_command(
+        program: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+        cols: u16,
+        rows: u16,
+    ) -> anyhow::Result<Pty> {
         let pair = NativePtySystem::default().openpty(PtySize {
             rows: rows.max(1),
             cols: cols.max(1),
@@ -58,7 +86,8 @@ impl Pty {
             pixel_height: 0,
         })?;
 
-        let mut cmd = CommandBuilder::new(shell_command());
+        let mut cmd = CommandBuilder::new(program);
+        cmd.args(args);
         cmd.cwd(cwd);
         let child = pair.slave.spawn_command(cmd)?;
 
@@ -135,13 +164,20 @@ impl Drop for Pty {
 mod tests {
     use super::*;
 
+    fn probe_pty() -> Pty {
+        // `cmd` rather than the default: under `cargo test` the running
+        // executable is the harness, not `batuta.exe`.
+        Pty::spawn_command("cmd.exe", &[], &std::env::temp_dir(), 80, 24).expect("spawn a shell")
+    }
+
     #[test]
-    fn the_shell_is_overridable_and_defaults_to_powershell() {
+    fn the_shell_defaults_to_our_own_and_stays_overridable() {
         // Not asserting on the variable itself: tests share a process, and
         // setting one would leak into whatever runs alongside.
+        let (program, args) = shell_command();
         assert!(
-            shell_command().contains("powershell") || std::env::var("BATUTA_SHELL").is_ok(),
-            "the default should be the shell people actually use"
+            args == ["shell"] || std::env::var("BATUTA_SHELL").is_ok(),
+            "should run Batuta's own shell by default, got {program:?} {args:?}"
         );
     }
 
@@ -156,7 +192,7 @@ mod tests {
         // reach a prompt with only this layer running, and a test that
         // demanded one would be asserting something impossible by design.
         // `session.rs` carries that end-to-end test, with a parser attached.
-        let mut pty = Pty::spawn(&std::env::temp_dir(), 80, 24).expect("spawn a shell");
+        let mut pty = probe_pty();
         assert!(pty.alive(), "the shell should still be running");
 
         let first = pty
@@ -172,7 +208,7 @@ mod tests {
 
     #[test]
     fn resizing_a_live_pty_does_not_fail() {
-        let pty = Pty::spawn(&std::env::temp_dir(), 80, 24).expect("spawn");
+        let pty = probe_pty();
         pty.resize(120, 40);
         // Zero is what a terminal dragged shut reports for a frame, and it
         // must not take the process down.

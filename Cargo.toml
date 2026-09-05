@@ -36,6 +36,9 @@ vte = "0.15"
 # ConPTY sequencing, for the same reason as vte: the hand-rolled version
 # had every documented precondition right and still would not attach.
 portable-pty = "0.9"
+# Already vendored by portable-pty; used directly for real pipe control
+# and for duplicating a handle, which is what makes `2>&1` correct.
+filedescriptor = "0.8"
 
 [profile.release]
 opt-level = 3

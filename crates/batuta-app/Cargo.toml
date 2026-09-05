@@ -23,6 +23,7 @@ parking_lot.workspace = true
 ratatui.workspace = true
 vte.workspace = true
 portable-pty.workspace = true
+filedescriptor.workspace = true
 windows-service = "0.7"
 
 [target.'cfg(windows)'.dependencies.windows-sys]

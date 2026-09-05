@@ -12,6 +12,7 @@ mod query;
 mod scan;
 mod service;
 mod setup;
+mod shell;
 mod tui;
 mod watcher;
 
@@ -123,6 +124,9 @@ enum Command {
     /// Service entry point, started by Windows.
     #[command(hide = true)]
     ServiceRun,
+    /// Batuta's own shell, run inside the terminal pane.
+    #[command(hide = true)]
+    Shell,
     /// Resident global-hotkey helper.
     #[command(hide = true)]
     Hotkey {
@@ -245,6 +249,10 @@ fn run() -> Result<()> {
         Command::Setup { elevated } => do_setup(&cfg, *elevated),
         Command::Uninstall => do_uninstall(&cfg),
         Command::ServiceRun => service::run(),
+        Command::Shell => {
+            let code = shell::repl::main_loop()?;
+            std::process::exit(code);
+        }
         Command::Hotkey { combo } => {
             hotkey::run(combo, &cfg.exe_path(), &cfg.data_dir.join("hotkey.log"))
                 .map_err(Into::into)
