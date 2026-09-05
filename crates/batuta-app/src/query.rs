@@ -57,10 +57,18 @@ fn to_query(a: &SearchArgs, idx: &Index) -> Query {
 /// and expects the folder it names to be listed, not a name search — which
 /// could never match anyway, since stored names contain no separators.
 pub fn looks_like_path(text: &str) -> bool {
-    let b = text.as_bytes();
-    (b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic())
-        || text.contains('\\')
-        || text.contains('/')
+    has_drive(text) || text.contains('\\') || text.contains('/')
+}
+
+/// Does this text start with a drive spec, as a real path always does?
+///
+/// The difference between text somebody *pasted* and text somebody *typed*.
+/// `C:\Users\Hacker\report` is a path that failed to resolve; `hacker\report`
+/// is two words with a separator between them, and was never a path at all.
+/// They deserve different treatment when nothing matches.
+fn has_drive(text: &str) -> bool {
+    let b = text.trim().as_bytes();
+    b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()
 }
 
 /// Split a path-like query into the directory to list and the partial name
@@ -93,6 +101,37 @@ pub fn last_segment(text: &str) -> &str {
     text.rsplit(['\\', '/'])
         .find(|s| !s.is_empty())
         .unwrap_or(text)
+}
+
+/// A path that resolved to nothing, rewritten as the terms it is made of.
+///
+/// `hacker\downloads` becomes `hacker downloads` — the same search a space
+/// would have given, and matched against the whole path.
+///
+/// This used to keep only the last segment, on the grounds that a name can
+/// never contain a separator so the full text could not match. That was true
+/// when names were all that got searched. Since terms are matched against the
+/// whole path, every segment the user typed is usable, and throwing all but
+/// the last one away silently answered a different question from the one asked:
+/// `hacker\downloads` returned the same rows as plain `downloads`.
+///
+/// A drive spec is dropped rather than kept as a term. `C:` is not a word
+/// anybody is searching for, and as a term it would match nothing and take the
+/// whole query down with it.
+pub fn path_terms(text: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in text.split(['\\', '/']) {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        let b = seg.as_bytes();
+        if b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+            continue;
+        }
+        out.push(seg);
+    }
+    out.join(" ")
 }
 
 /// Answer one request.
@@ -139,21 +178,32 @@ pub fn execute(
                     q.text = partial.clone();
                     searcher.search(idx, &q)
                 }
-                // The path names no indexed folder — a typo, or a drive the
-                // index does not cover. Nothing is lost by going straight to
-                // the fallback: names cannot contain a separator, so the
-                // full text could never have matched.
+                // The path names no indexed folder — a typo, a drive the index
+                // does not cover, or text that was never a path at all. Its
+                // segments are still what the user asked for, so they become
+                // AND terms rather than being thrown away.
                 None if pathish => {
-                    q.text = last_segment(&args.query).to_string();
+                    q.text = path_terms(&args.query);
                     searcher.search(idx, &q)
                 }
                 None => searcher.search(idx, &q),
             };
 
-            // The folder resolved but nothing matched: an empty directory, a
-            // partial no child starts with. The final component is still
-            // worth a plain name search.
-            if r.nodes.is_empty() && browse.is_some() {
+            // Nothing matched, and the query was path-shaped. The last
+            // component is worth a plain name search — but only for the two
+            // cases where dropping the rest is defensible:
+            //
+            // - the folder *did* resolve and the partial matched no child, so
+            //   this widens a listing rather than discarding anything typed;
+            // - the query names a drive, so it is a path somebody pasted that
+            //   this index does not cover, and the file name is still a
+            //   reasonable guess at what they wanted.
+            //
+            // Not for `hacker\downloads`, which was never a path. Retrying that
+            // with fewer terms is exactly the behaviour that made it return the
+            // rows of a plain `downloads` search.
+            let retry = browse.is_some() || has_drive(&args.query);
+            if r.nodes.is_empty() && retry {
                 q.mode = MatchMode::Substring;
                 q.children_of = None;
                 q.text = last_segment(&args.query).to_string();
@@ -458,6 +508,74 @@ mod tests {
             Response::Rows { rows, .. } => rows.into_iter().map(|r| r.path).collect(),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_path_that_resolves_to_nothing_searches_all_of_its_segments() {
+        // The reported bug: `hacker\downloads` returned exactly the rows of a
+        // plain `downloads` search, because everything but the last segment
+        // was thrown away. `hacker` names no resolvable directory — it has no
+        // drive — so this goes down the fallback.
+        let idx = sample();
+
+        let both = search_text(&idx, r"hacker\downloads");
+        assert!(!both.is_empty(), "the obvious answer should still be found");
+        assert!(
+            both.iter().all(|p| p.to_lowercase().contains("hacker")),
+            "every row has to satisfy the term that used to be discarded: {both:?}"
+        );
+        assert!(
+            both.iter().any(|p| p == r"C:\Users\Hacker\Downloads"),
+            "including the folder itself: {both:?}"
+        );
+    }
+
+    #[test]
+    fn a_drive_letter_is_not_treated_as_a_search_term() {
+        // `C:` is not a word anybody is looking for, and as a term it would
+        // match nothing and take the whole query down with it.
+        assert_eq!(path_terms(r"C:\Users\Hacker"), "Users Hacker");
+        assert_eq!(path_terms("c:/users/hacker"), "users hacker");
+        assert_eq!(path_terms(r"hacker\downloads"), "hacker downloads");
+        assert_eq!(path_terms(r"\downloads"), "downloads");
+        assert_eq!(path_terms(r"C:\"), "", "a bare drive has no terms at all");
+    }
+
+    #[test]
+    fn a_query_that_was_never_a_path_keeps_every_segment() {
+        // No drive, so this is two words with a separator, not a pasted path.
+        // Retrying it with fewer terms is exactly the bug being fixed.
+        let idx = sample();
+        let rows = search_text(&idx, "notes.txt/installer");
+        assert!(
+            rows.is_empty(),
+            "no segment may be dropped to manufacture a result: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_folder_that_resolves_but_matches_nothing_still_widens_to_a_search() {
+        // The one surviving retry, and it drops no term the user typed: the
+        // folder was found, the partial matched no child in it, so the partial
+        // is worth looking for elsewhere.
+        let idx = sample();
+        assert_eq!(
+            search_text(&idx, r"C:\Users\Hacker\report"),
+            vec![r"C:\Users\Hacker\Downloads\report.pdf".to_string()],
+        );
+    }
+
+    #[test]
+    fn a_path_that_does_resolve_still_browses_rather_than_searching() {
+        // The fallback must not have taken over the case that already worked.
+        let idx = sample();
+        assert_eq!(
+            search_text(&idx, r"C:\Users\Hacker\Downloads\"),
+            vec![
+                r"C:\Users\Hacker\Downloads\installer.exe".to_string(),
+                r"C:\Users\Hacker\Downloads\report.pdf".to_string(),
+            ]
+        );
     }
 
     #[test]

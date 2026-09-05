@@ -1031,3 +1031,212 @@ fn memory_footprint_stays_within_budget() {
         "per-node cost {per_node:.1} B would exceed the memory budget at scale"
     );
 }
+
+/// A tree shaped like the one that exposed the ranking problem: several names
+/// containing "downloads", one of them actually called it, and one sorting
+/// ahead of it alphabetically because it starts with an underscore.
+fn downloads_tree() -> Index {
+    let mut t = TreeBuilder::new('C');
+    let users = t.dir(ROOT_REC, "Users");
+    let hacker = t.dir(users, "Hacker");
+    let python = t.dir(ROOT_REC, "Python313");
+    let doc = t.dir(python, "Doc");
+
+    t.dir(hacker, "Downloads");
+    t.dir(doc, "_downloads");
+    t.dir(hacker, "DownloadsFolder");
+    t.dir(python, "zzz_downloads_cache");
+    t.build()
+}
+
+#[test]
+fn a_name_that_is_the_query_sorts_above_one_that_merely_contains_it() {
+    // `_downloads` beats `Downloads` alphabetically, because `_` is 0x5F and
+    // `d` is 0x64. Alphabetically right, and the wrong answer: the folder
+    // actually called Downloads is the one being looked for.
+    let idx = downloads_tree();
+    let mut s = Searcher::default();
+    let mut q = Query::new("downloads");
+    q.sort = SortBy::Name;
+
+    let names = names_of(&idx, &s.search(&idx, &q).nodes);
+    assert_eq!(names[0], "Downloads", "exact match first, got {names:?}");
+}
+
+#[test]
+fn names_starting_with_the_query_come_before_ones_that_only_contain_it() {
+    let idx = downloads_tree();
+    let mut s = Searcher::default();
+    let mut q = Query::new("downloads");
+    q.sort = SortBy::Name;
+
+    let names = names_of(&idx, &s.search(&idx, &q).nodes);
+    assert_eq!(
+        names,
+        vec![
+            "Downloads",           // is the term
+            "DownloadsFolder",     // starts with it
+            "_downloads",          // merely contains it, and sorts first
+            "zzz_downloads_cache", // of the two, alphabetically after
+        ],
+        "three tiers, alphabetical within each"
+    );
+}
+
+#[test]
+fn ranking_uses_any_term_not_the_whole_query() {
+    // A multi-term query describes a path; the node at the end of it is named
+    // after one term, never the sentence. `hacker downloads` has to put the
+    // folder called Downloads first even though nothing is called that.
+    let idx = downloads_tree();
+    let mut s = Searcher::default();
+    let mut q = Query::new("hacker downloads");
+    q.sort = SortBy::Name;
+
+    let names = names_of(&idx, &s.search(&idx, &q).nodes);
+    assert_eq!(names[0], "Downloads", "got {names:?}");
+}
+
+#[test]
+fn ranking_reaches_the_size_and_modified_sorts_too() {
+    // Otherwise the exact answer sinks the moment you change the sort, which
+    // is the one thing a sort should not do.
+    let mut t = TreeBuilder::new('C');
+    let d = t.dir(ROOT_REC, "d");
+    t.file(d, "notes", 1);
+    t.file(d, "notes_backup_huge", 900 * MB);
+    let idx = t.build();
+
+    let mut s = Searcher::default();
+    let mut q = Query::new("notes");
+    q.sort = SortBy::SizeDesc;
+    assert_eq!(
+        names_of(&idx, &s.search(&idx, &q).nodes)[0],
+        "notes",
+        "the exact name outranks the far larger file"
+    );
+
+    s.reset();
+    q.sort = SortBy::ModifiedDesc;
+    assert_eq!(names_of(&idx, &s.search(&idx, &q).nodes)[0], "notes");
+}
+
+#[test]
+fn ranking_is_case_insensitive_like_the_matching() {
+    let mut t = TreeBuilder::new('C');
+    let d = t.dir(ROOT_REC, "d");
+    t.dir(d, "_DOWNLOADS");
+    t.dir(d, "DOWNLOADS");
+    let idx = t.build();
+
+    let mut s = Searcher::default();
+    let mut q = Query::new("downloads");
+    q.sort = SortBy::Name;
+    assert_eq!(names_of(&idx, &s.search(&idx, &q).nodes)[0], "DOWNLOADS");
+}
+
+#[test]
+fn an_empty_query_is_ranked_by_the_sort_alone() {
+    // No terms means no tiers; listing everything must stay alphabetical.
+    let idx = downloads_tree();
+    let mut s = Searcher::default();
+    let mut q = Query::new("");
+    q.dirs_only = true;
+    q.sort = SortBy::Name;
+
+    let names = names_of(&idx, &s.search(&idx, &q).nodes);
+    let mut expected = names.clone();
+    expected.sort_by_key(|n| n.to_ascii_lowercase());
+    assert_eq!(names, expected, "still plain alphabetical");
+}
+
+#[test]
+fn among_equally_exact_matches_the_shallower_path_wins() {
+    // Several folders genuinely called what you searched for is the normal
+    // case, and their names cannot separate them. Node id would decide it by
+    // accident of scan order.
+    let mut t = TreeBuilder::new('C');
+    let users = t.dir(ROOT_REC, "Users");
+    let hacker = t.dir(users, "Hacker");
+    let cloud = t.dir(hacker, "iCloudDrive");
+    let appdata = t.dir(hacker, "AppData");
+    let cache = t.dir(appdata, "cache");
+
+    // Deliberately created before the shallow one, so scan order argues for
+    // the wrong answer.
+    t.dir(cache, "Downloads");
+    t.dir(cloud, "Downloads");
+    t.dir(hacker, "Downloads");
+    let idx = t.build();
+
+    let mut s = Searcher::default();
+    let mut q = Query::new("downloads");
+    q.sort = SortBy::Name;
+
+    let paths: Vec<String> = s
+        .search(&idx, &q)
+        .nodes
+        .iter()
+        .map(|&n| idx.path(n))
+        .collect();
+    assert_eq!(paths[0], r"C:\Users\Hacker\Downloads", "got {paths:?}");
+}
+
+#[test]
+fn ranking_leaves_the_result_set_a_permutation_of_the_matches() {
+    // Grouping by rank rewrites the array in three pieces; dropping or
+    // duplicating one would silently lose matches or show them twice.
+    let mut t = TreeBuilder::new('C');
+    let d = t.dir(ROOT_REC, "d");
+    for i in 0..500 {
+        t.file(d, &format!("item{i:03}_x.bin"), i as u64 + 1);
+    }
+    t.file(d, "x", 1);
+    t.dir(d, "x_prefixed");
+    let idx = t.build();
+
+    let mut s = Searcher::default();
+    for sort in [SortBy::Name, SortBy::SizeDesc, SortBy::ModifiedDesc] {
+        s.reset();
+        let mut q = Query::new("x");
+        q.sort = sort;
+        q.limit = 0;
+        let r = s.search(&idx, &q);
+
+        let mut seen = r.nodes.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), r.nodes.len(), "{sort:?} duplicated a row");
+        assert_eq!(r.nodes.len(), r.total, "{sort:?} lost a row");
+        assert_eq!(idx.name(r.nodes[0]), "x", "{sort:?} exact match first");
+    }
+}
+
+#[test]
+fn paging_through_a_ranked_result_set_still_tiles_it_exactly() {
+    // The ordered-prefix bookkeeping is what a scrolling UI relies on, and
+    // grouping by rank is where it could go wrong.
+    let mut t = TreeBuilder::new('C');
+    let d = t.dir(ROOT_REC, "d");
+    for i in 0..300 {
+        t.file(d, &format!("note{i:03}.txt"), i as u64 + 1);
+    }
+    t.file(d, "note", 1);
+    let idx = t.build();
+
+    let mut s = Searcher::default();
+    let mut seen = Vec::new();
+    for page in 0..7 {
+        let mut q = Query::new("note");
+        q.sort = SortBy::Name;
+        q.offset = page * 50;
+        q.limit = 50;
+        seen.extend(s.search(&idx, &q).nodes);
+    }
+    let mut sorted = seen.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), seen.len(), "a row appeared on two pages");
+    assert_eq!(seen.len(), 301, "every match appears exactly once");
+    assert_eq!(idx.name(seen[0]), "note", "the exact match leads");
+}

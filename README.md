@@ -112,10 +112,42 @@ ancestors matched. That leaves a small candidate set for the authoritative walk
 to confirm. Typing a second word costs a few extra milliseconds, not a
 different order of magnitude.
 
+**A name that *is* what you typed comes first**, then names that start with it,
+then everything that merely contains it — and within each group, whatever sort
+you picked. Plain alphabetical put `C:\Python313\Doc\html\_downloads` above
+`C:\Users\You\Downloads`, because `_` is 0x5F and `d` is 0x64: correct, and the
+wrong answer. Only three tiers, deliberately: enough to float the obvious
+answer without turning the sort you chose into a score you cannot predict. An
+exact match on *any* term counts, because a multi-term query describes a path
+and the thing at the end of it is named after one word, not the sentence.
+
+Several folders genuinely called what you searched for is the normal case, and
+their names cannot separate them. The shallower path wins that tie, so your own
+`Downloads` beats one buried in a package cache.
+
+Ranking is done by grouping the matches once rather than inside the comparison.
+The obvious way round cost 40% on a query matching two million nodes, because
+reading a name is a random probe into the name arena and a sort would do it
+twice per comparison instead of once per node.
+
 Typing a path browses it: `C:\` lists the root of the drive, `C:\Users\`
 lists that directory, and `C:\Users\Dev` filters the directory to names
-starting with `Dev`. If the path names no indexed directory, the last
-segment falls back to a normal name search, so a typo still shows something.
+starting with `Dev`.
+
+A path that names no indexed directory becomes AND terms — `hacker\downloads`
+searches for exactly what `hacker downloads` would, and the drive letter is
+dropped rather than searched for. It used to keep only the last segment, which
+made that query return the same rows as a plain `downloads` search: `hacker`
+was silently discarded. Keeping only the last segment made sense when names
+were all that got searched and no name can contain a separator; once terms are
+matched against the whole path, every segment you typed is usable.
+
+The last segment is still searched on its own in two cases, neither of which
+discards anything: the folder resolved but nothing in it matched, so the search
+widens out of that listing; or the query names a drive, meaning it is a path
+somebody pasted that this index does not cover, and the file name is a fair
+guess at what they were after. A query with no drive in it was never a path, so
+it keeps every term and an empty result stays empty.
 `Tab` completes the drill-down: the highlighted directory's real path becomes
 the query, with a trailing separator so you keep narrowing inside it. It works
 from a plain name search too — you rarely know the path you want in advance,

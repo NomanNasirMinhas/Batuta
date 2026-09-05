@@ -282,7 +282,7 @@ impl Searcher {
         let mut sorted = matches.clone();
         self.last_matches = matches;
 
-        self.last_ordered = sort_results(idx, &mut sorted, q.sort, q.offset, q.limit);
+        self.last_ordered = sort_results(idx, &mut sorted, &q.text, q.sort, q.offset, q.limit);
         let nodes = page(&sorted, q.offset, q.limit);
         self.last_sorted = sorted;
         self.last_sort = Some(q.sort);
@@ -720,14 +720,63 @@ fn name_cmp(x: &[u8], y: &[u8]) -> Ordering {
     x.len().cmp(&y.len())
 }
 
+/// How well a name answers the query, ahead of whatever sort was asked for.
+///
+/// Sorting purely by name puts `_downloads` above `Downloads`, because `_` is
+/// 0x5F and `d` is 0x64. Alphabetically that is correct and it is still the
+/// wrong answer: a folder actually *called* what you typed is the thing you
+/// were looking for, and it was landing below anything whose name merely
+/// contains the word.
+///
+/// Three tiers, deliberately not more. Exact, then prefix, then everything
+/// else — enough to float the obvious answer without turning the sort the user
+/// picked into a scoring function they cannot see or predict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(usize)]
+enum Rank {
+    /// The name *is* one of the terms.
+    Exact = 0,
+    /// The name starts with one of them.
+    Prefix = 1,
+    Other = 2,
+}
+
+/// Rank one name against the query's terms.
+///
+/// Any term, not all of them: a multi-term query describes a path, and the
+/// node at the end of it is named after one term, not the sentence.
+/// `hacker downloads` should put `...\Hacker\Downloads` first, and that
+/// folder's name is `Downloads`.
+fn rank_name(name: &[u8], terms: &[&[u8]]) -> Rank {
+    let mut best = Rank::Other;
+    for term in terms {
+        if name.len() < term.len() {
+            continue;
+        }
+        // Length first: it rejects almost everything without touching bytes.
+        if name.len() == term.len() && name.eq_ignore_ascii_case(term) {
+            return Rank::Exact;
+        }
+        if name[..term.len()].eq_ignore_ascii_case(term) {
+            best = Rank::Prefix;
+        }
+    }
+    best
+}
+
 /// Order `nodes` far enough to serve the page at `offset..offset + limit`.
 ///
 /// Returns how many leading entries are actually in order. Beyond that the
 /// array is only partitioned, so a later page cannot be served from it without
 /// sorting again.
+///
+/// `text` is the query the matches came from, used only for ranking. Passing
+/// it rather than re-deriving it keeps the ranking and the matching working
+/// from the same words.
 fn sort_results(
     idx: &Index,
     nodes: &mut [u32],
+    text: &str,
     sort: SortBy,
     offset: usize,
     limit: usize,
@@ -744,44 +793,105 @@ fn sort_results(
         .saturating_add(limit)
         .max(MIN_ORDERED)
         .min(nodes.len());
-    let partial = limit > 0 && want < nodes.len();
+    let limited = limit > 0;
+
+    // Lowercasing happens inside the comparison, so the terms stay as typed;
+    // collecting them once keeps the split out of the inner loop.
+    let terms: Vec<&[u8]> = terms(text)
+        .into_iter()
+        .map(str::as_bytes)
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    // Node id breaks ties so equal entries order deterministically rather than
+    // depending on the unstable sort's internal choices.
     match sort {
-        SortBy::Name => {
-            let cmp =
-                |a: &u32, b: &u32| name_cmp(idx.name_bytes(*a), idx.name_bytes(*b)).then(a.cmp(b));
-            if partial {
-                nodes.select_nth_unstable_by(want, cmp);
-                nodes[..want].sort_unstable_by(cmp);
-            } else {
-                nodes.sort_unstable_by(cmp);
-            }
-        }
-        SortBy::SizeDesc => {
-            // Node id breaks ties so equal-sized entries order deterministically
-            // rather than depending on the unstable sort's internal choices.
-            let key = |n: &u32| (std::cmp::Reverse(idx.size[*n as usize]), *n);
-            if partial {
-                nodes.select_nth_unstable_by_key(want, key);
-                nodes[..want].sort_unstable_by_key(key);
-            } else {
-                nodes.sort_unstable_by_key(key);
-            }
-        }
-        SortBy::ModifiedDesc => {
-            let key = |n: &u32| (std::cmp::Reverse(idx.mtime[*n as usize]), *n);
-            if partial {
-                nodes.select_nth_unstable_by_key(want, key);
-                nodes[..want].sort_unstable_by_key(key);
-            } else {
-                nodes.sort_unstable_by_key(key);
-            }
-        }
+        // Depth before node id: several folders genuinely called what you
+        // searched for is the normal case, and their names cannot separate
+        // them. The shallower one is the one people mean —
+        // `C:\Users\You\Downloads` over `C:\Users\You\...\cache\downloads` —
+        // and node id would have decided it by accident of scan order.
+        SortBy::Name => ranked(idx, nodes, &terms, want, limited, |a, b| {
+            name_cmp(idx.name_bytes(*a), idx.name_bytes(*b))
+                .then_with(|| idx.depth[*a as usize].cmp(&idx.depth[*b as usize]))
+                .then(a.cmp(b))
+        }),
+        SortBy::SizeDesc => ranked(idx, nodes, &terms, want, limited, |a, b| {
+            idx.size[*b as usize]
+                .cmp(&idx.size[*a as usize])
+                .then(a.cmp(b))
+        }),
+        SortBy::ModifiedDesc => ranked(idx, nodes, &terms, want, limited, |a, b| {
+            idx.mtime[*b as usize]
+                .cmp(&idx.mtime[*a as usize])
+                .then(a.cmp(b))
+        }),
     }
-    if partial {
+}
+
+/// Order the first `want` of `xs` by `cmp`; returns how many are in order.
+fn order_prefix<F>(xs: &mut [u32], want: usize, limited: bool, cmp: F) -> usize
+where
+    F: Fn(&u32, &u32) -> Ordering + Copy,
+{
+    let want = want.min(xs.len());
+    if limited && want < xs.len() {
+        xs.select_nth_unstable_by(want, cmp);
+        xs[..want].sort_unstable_by(cmp);
         want
     } else {
-        nodes.len()
+        xs.sort_unstable_by(cmp);
+        xs.len()
     }
+}
+
+/// Group by rank, then order within each group.
+///
+/// Ranking inside the comparator was the obvious way to write this and cost
+/// 40% on a query matching two million nodes: `name_bytes` is a random probe
+/// into the name arena, and a comparison-based sort would do it twice per
+/// comparison rather than once per node.
+///
+/// Grouping first pays it exactly once each. It also means the expensive group
+/// — everything that only *contains* a term — is usually never ordered at all,
+/// because the exact and prefix matches ahead of it already fill the page.
+fn ranked<F>(
+    idx: &Index,
+    nodes: &mut [u32],
+    terms: &[&[u8]],
+    want: usize,
+    limited: bool,
+    cmp: F,
+) -> usize
+where
+    F: Fn(&u32, &u32) -> Ordering + Copy,
+{
+    // An empty query ranks everything the same, so there is nothing to group
+    // by and the copying below would be pure overhead.
+    if terms.is_empty() {
+        return order_prefix(nodes, want, limited, cmp);
+    }
+
+    let mut groups: [Vec<u32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for &n in nodes.iter() {
+        groups[rank_name(idx.name_bytes(n), terms) as usize].push(n);
+    }
+
+    let mut at = 0;
+    let mut ordered = 0;
+    for group in groups.iter_mut() {
+        // Every group is copied back, whether or not it was worth ordering:
+        // the array has to stay a permutation of the matches.
+        let got = order_prefix(group, want.saturating_sub(ordered), limited, cmp);
+        nodes[at..at + group.len()].copy_from_slice(group);
+        at += group.len();
+        // A group only extends the ordered prefix if everything before it was
+        // ordered too, which is exactly the case while `ordered` has kept up.
+        if ordered == at - group.len() {
+            ordered += got;
+        }
+    }
+    ordered
 }
 
 /// Slice one page out of an ordered match list.
