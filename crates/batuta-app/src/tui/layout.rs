@@ -104,6 +104,10 @@ pub struct ExplorerPanes {
     /// The directory tree, or `None` when the terminal is too narrow.
     pub tree: Option<Rect>,
     pub editor: Rect,
+    /// The find prompt, only while it is showing. It takes its row from the
+    /// editor rather than from the path bar: losing a line of text for the
+    /// duration of a search is cheaper than hiding the path you are editing.
+    pub find: Option<Rect>,
     pub path: Rect,
     pub status: Rect,
     pub compact: bool,
@@ -113,7 +117,7 @@ pub struct ExplorerPanes {
 ///
 /// Same degradation rule as [`compute`]: drop the least important thing first.
 /// Here that is the tree, then the path bar's frame.
-pub fn explorer(area: Rect, tree_wanted: bool) -> ExplorerPanes {
+pub fn explorer(area: Rect, tree_wanted: bool, finding: bool) -> ExplorerPanes {
     let compact = area.height <= COMPACT_MAX_ROWS;
     let path_h = if compact { PATH_BARE } else { PATH_FRAMED };
 
@@ -137,10 +141,21 @@ pub fn explorer(area: Rect, tree_wanted: bool) -> ExplorerPanes {
         (None, main)
     };
 
+    // The prompt takes the editor's last row, and only when there is a row to
+    // spare: at one row high the editor would be left with nothing, and a find
+    // bar with no text to search is worse than no find bar.
+    let (editor, find) = if finding && editor.height > 1 {
+        let split = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(editor);
+        (split[0], Some(split[1]))
+    } else {
+        (editor, None)
+    };
+
     ExplorerPanes {
         title,
         tree,
         editor,
+        find,
         path,
         status,
         compact,
@@ -246,7 +261,7 @@ mod tests {
     #[test]
     fn the_explorer_gives_every_pane_room_when_there_is_room() {
         let a = area(140, 40);
-        let p = explorer(a, true);
+        let p = explorer(a, true, false);
         assert!(p.tree.is_some());
         assert_eq!(p.tree.unwrap().width, TREE_WIDTH);
         assert_eq!(p.path.width, a.width, "a path deserves the whole width");
@@ -257,7 +272,7 @@ mod tests {
     #[test]
     fn the_explorer_tree_gives_way_before_the_editor_does() {
         let a = area(TREE_MIN_COLS - 1, 40);
-        let p = explorer(a, true);
+        let p = explorer(a, true, false);
         assert!(p.tree.is_none());
         assert_eq!(p.editor.width, a.width, "the editor takes the columns");
     }
@@ -265,11 +280,11 @@ mod tests {
     #[test]
     fn a_short_terminal_unframes_the_explorer_path_bar() {
         let a = area(120, COMPACT_MAX_ROWS);
-        let p = explorer(a, true);
+        let p = explorer(a, true, false);
         assert!(p.compact);
         assert_eq!(p.path.height, PATH_BARE);
 
-        let tall = explorer(area(120, COMPACT_MAX_ROWS + 1), true);
+        let tall = explorer(area(120, COMPACT_MAX_ROWS + 1), true, false);
         assert_eq!(
             p.editor.height,
             tall.editor.height + 1,
@@ -280,27 +295,56 @@ mod tests {
     #[test]
     fn explorer_panes_never_overlap_and_stay_inside_the_frame() {
         for (w, h) in [(140, 40), (89, 40), (140, 12), (60, 8), (200, 60)] {
-            let a = area(w, h);
-            let p = explorer(a, true);
-            let mut all = vec![
-                ("title", p.title),
-                ("editor", p.editor),
-                ("path", p.path),
-                ("status", p.status),
-            ];
-            if let Some(t) = p.tree {
-                all.push(("tree", t));
-            }
-            for (i, (an, ar)) in all.iter().enumerate() {
-                for (bn, br) in all.iter().skip(i + 1) {
-                    assert!(!overlaps(*ar, *br), "{an} overlaps {bn} at {w}x{h}");
+            for finding in [false, true] {
+                let a = area(w, h);
+                let p = explorer(a, true, finding);
+                let mut all = vec![
+                    ("title", p.title),
+                    ("editor", p.editor),
+                    ("path", p.path),
+                    ("status", p.status),
+                ];
+                if let Some(t) = p.tree {
+                    all.push(("tree", t));
+                }
+                if let Some(fb) = p.find {
+                    all.push(("find", fb));
+                }
+                for (i, (an, ar)) in all.iter().enumerate() {
+                    for (bn, br) in all.iter().skip(i + 1) {
+                        assert!(!overlaps(*ar, *br), "{an} overlaps {bn} at {w}x{h}");
+                    }
+                }
+                for (n, r) in &all {
+                    assert!(
+                        r.x + r.width <= a.x + a.width && r.y + r.height <= a.y + a.height,
+                        "{n} escapes the frame at {w}x{h}"
+                    );
                 }
             }
-            for (n, r) in &all {
-                assert!(
-                    r.x + r.width <= a.x + a.width && r.y + r.height <= a.y + a.height,
-                    "{n} escapes the frame at {w}x{h}"
-                );
+        }
+    }
+
+    #[test]
+    fn the_find_bar_takes_its_row_from_the_editor_and_only_when_there_is_one() {
+        let a = area(140, 40);
+        let without = explorer(a, true, false);
+        let with = explorer(a, true, true);
+        assert!(without.find.is_none());
+        let bar = with.find.expect("a find bar when searching");
+        assert_eq!(bar.height, 1);
+        assert_eq!(
+            with.editor.height + 1,
+            without.editor.height,
+            "the row comes out of the editor"
+        );
+        assert_eq!(with.path, without.path, "and never out of the path bar");
+
+        // Too short to spare one: the editor keeps its only row.
+        for (w, h) in [(1, 1), (10, 3), (200, 4)] {
+            let small = explorer(area(w, h), true, true);
+            if small.editor.height <= 1 {
+                assert!(small.find.is_none(), "no room, so no bar at {w}x{h}");
             }
         }
     }
@@ -311,7 +355,7 @@ mod tests {
         // ratatui panics on a rect that leaves the buffer.
         for (w, h) in [(1, 1), (2, 2), (10, 3), (200, 1)] {
             let a = area(w, h);
-            let p = explorer(a, true);
+            let p = explorer(a, true, false);
             for r in [p.title, p.editor, p.path, p.status] {
                 assert!(
                     r.x + r.width <= a.x + a.width && r.y + r.height <= a.y + a.height,

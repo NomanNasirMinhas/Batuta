@@ -173,8 +173,10 @@ ones a single missed guard away from firing.
 | `Shift+Enter` | open in the default application |
 | `Ctrl+S` | save |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo |
+| `Ctrl+F` | find in the open file |
+| `F3` / `Shift+F3` | next / previous match |
 | `F5` | re-read the directory |
-| `Esc` | back to search |
+| `Ctrl+E` | back to search |
 
 `Ctrl` with any arrow moves between panes outright, whatever the caret is
 doing — down reaches the path bar, up comes back to whichever pane you left.
@@ -221,8 +223,21 @@ save, discard, or stay — and `Enter` deliberately does nothing, because it is
 the key most likely to be hit from habit and one of those branches throws work
 away.
 
-Not yet done: find-in-file, and syntax highlighting and formatters are out of
-scope by choice.
+`Ctrl+F` finds text in the open file, searching as you type and picking out
+every hit on screen — the same treatment the result list gives matched terms,
+for the same reason. `Enter` keeps the hit you landed on and closes the prompt;
+`Esc` abandons the search and puts the cursor back where it started, so a
+search that found nothing has not moved you. `F3` and `Shift+F3` step between
+hits afterwards, wrapping at either end, and re-run the search each time so an
+edit made in between cannot send you to a line the word has left.
+
+`Ctrl+F` rather than `/`, which is the traditional spelling: in an editor a
+slash is a character somebody is trying to type.
+
+Syntax highlighting and formatters are out of scope by choice. Formatting means
+shelling out to a per-language tool that has to be installed, found, and run
+against a project it understands; it fails confusingly more often than it
+works, and none of it is Batuta's job.
 
 `Ctrl+C` opens a **terminal** in the highlighted folder, or the folder holding
 the highlighted file. It is a real terminal — a pseudo-console with a VT
@@ -280,7 +295,8 @@ wheel scroll the history.
 
 `Esc` no longer closes anything in the explorer or the terminal. Reflexively
 pressing it should not throw away an open editor, so the key that opened a view
-is the key that leaves it.
+is the key that leaves it. The one thing it still does is cancel the find
+prompt, which closes a prompt rather than a view and so cannot lose any work.
 
 Both views draw a **title bar** with minimise, maximise and close. That is not
 decoration: the launcher window is deliberately borderless, which took the real

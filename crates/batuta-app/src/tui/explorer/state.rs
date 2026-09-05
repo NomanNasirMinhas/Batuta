@@ -34,6 +34,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::buffer::{Buffer, Cursor};
 use super::file::{self, Loaded, Stamp};
+use super::find::Find;
 use super::tree::{Lister, Row, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +93,9 @@ pub struct Explorer {
     /// has a shared borrow — the same split the rest of the UI already keeps
     /// between preparing data and drawing it.
     pub rows: Vec<Row>,
+    /// Find-in-file. Present whether or not the prompt is showing, so `F3`
+    /// keeps working after it is closed.
+    pub find: Find,
     /// The pane focus returns to from the path bar.
     last_pane: Focus,
 }
@@ -108,6 +112,7 @@ impl Explorer {
             path_text,
             top_line: 0,
             rows: Vec::new(),
+            find: Find::default(),
             last_pane: Focus::Tree,
         }
     }
@@ -128,6 +133,9 @@ impl Explorer {
         self.top_line = 0;
         self.path_text = path.display().to_string();
         self.path_caret = self.path_text.chars().count();
+        // Hits belong to the file they were found in. Carrying them into
+        // another document would highlight lines at random.
+        self.find = Find::default();
 
         match file::load(path) {
             Ok(Loaded::Text(buffer)) => {
@@ -203,8 +211,27 @@ impl Explorer {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+        // The find prompt, while it is showing, owns the keyboard outright.
+        // Handled before everything else so a typed `s` narrows the search
+        // rather than saving the file.
+        if self.find.open {
+            return self.key_find(key, visible, ctrl);
+        }
+
         // Always available, whatever has focus.
         match key.code {
+            // Ctrl+F rather than `/`: in an editor a slash is a character
+            // someone is trying to type, and stealing it would be unusable.
+            KeyCode::Char('f' | 'F') if ctrl => {
+                self.open_find(visible);
+                return Action::None;
+            }
+            // Stepping between hits without the prompt in the way, using the
+            // query it left behind.
+            KeyCode::F(3) => {
+                self.step_find(!shift, visible);
+                return Action::None;
+            }
             // Both cases: Caps Lock makes these arrive uppercase, and a
             // shortcut that quietly stops working is worse than one that
             // never existed.
@@ -247,6 +274,108 @@ impl Explorer {
             Focus::Editor => self.key_editor(key, visible, shift, ctrl),
             Focus::Path => self.key_path(key),
         }
+    }
+
+    // ---- find in file -----------------------------------------------------
+
+    /// Show the find prompt, if there is anything to search.
+    ///
+    /// A binary file or an unreadable one has no document, and a find bar over
+    /// a message panel would be a prompt that can never match.
+    fn open_find(&mut self, visible: usize) {
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        self.focus = Focus::Editor;
+        let at = doc.buffer.cursor();
+        let lines = doc.buffer.lines().to_vec();
+        self.find.open(at, &lines);
+        self.go_to_hit(visible);
+    }
+
+    /// Move to the hit the find state is pointing at, if any.
+    fn go_to_hit(&mut self, visible: usize) {
+        let Some(at) = self.find.cursor() else {
+            return;
+        };
+        if let Some(doc) = self.doc.as_mut() {
+            doc.buffer.goto(at);
+        }
+        self.scroll_into_view(visible);
+    }
+
+    /// `F3` and `Shift+F3` outside the prompt, on the remembered query.
+    ///
+    /// Re-running the search rather than trusting the stored hits: the file may
+    /// have been edited since, and stepping to a position that no longer holds
+    /// the word is worse than finding nothing.
+    fn step_find(&mut self, forward: bool, visible: usize) {
+        if self.find.query.is_empty() {
+            return;
+        }
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let lines = doc.buffer.lines().to_vec();
+        // Anchored where the cursor is, not where the search started, so
+        // repeated F3 walks forward instead of restarting.
+        self.find.rescan(&lines, doc.buffer.cursor());
+        if forward {
+            self.find.next();
+        } else {
+            self.find.previous();
+        }
+        self.go_to_hit(visible);
+    }
+
+    /// The keyboard while the find prompt is showing.
+    fn key_find(&mut self, key: KeyEvent, visible: usize, ctrl: bool) -> Action {
+        let lines = match self.doc.as_ref() {
+            Some(doc) => doc.buffer.lines().to_vec(),
+            // The document went away underneath the prompt; close it rather
+            // than searching nothing.
+            None => {
+                self.find.open = false;
+                return Action::None;
+            }
+        };
+
+        match key.code {
+            // Accept: keep the cursor where the search put it, and leave the
+            // query behind for F3.
+            KeyCode::Enter if !ctrl => {
+                self.find.open = false;
+                return Action::None;
+            }
+            // Abandon: back to where the search started. This is the one place
+            // Esc still does something, and it closes a prompt rather than a
+            // view, so it cannot lose an editor.
+            KeyCode::Esc => {
+                self.find.open = false;
+                let origin = self.find.origin();
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.buffer.goto(origin);
+                }
+                self.scroll_into_view(visible);
+                return Action::None;
+            }
+            KeyCode::Up => {
+                self.find.previous();
+            }
+            KeyCode::Down => {
+                self.find.next();
+            }
+            KeyCode::F(3) => {
+                self.find.next();
+            }
+            KeyCode::Left => self.find.left(),
+            KeyCode::Right => self.find.right(),
+            KeyCode::Backspace => self.find.backspace(&lines),
+            KeyCode::Char(c) if !ctrl => self.find.insert(c, &lines),
+            _ => {}
+        }
+        self.go_to_hit(visible);
+        Action::None
     }
 
     fn cross_left(&mut self) {
@@ -564,6 +693,162 @@ mod tests {
             stamp: None,
         });
         x
+    }
+
+    /// A document with something worth searching for.
+    fn with_text(text: &str) -> Explorer {
+        let mut x = with_doc();
+        x.doc.as_mut().unwrap().buffer = Buffer::from_str(text);
+        x
+    }
+
+    fn type_into(x: &mut Explorer, fs: &Fake, text: &str) {
+        for c in text.chars() {
+            x.key(key(KeyCode::Char(c)), 10, fs);
+        }
+    }
+
+    #[test]
+    fn ctrl_f_opens_find_and_typing_jumps_to_the_first_match() {
+        let fs = Fake::new(&[]);
+        let mut x = with_text("nothing\nthe needle\nmore");
+        x.focus = Focus::Editor;
+
+        x.key(ctrl(KeyCode::Char('f')), 10, &fs);
+        assert!(x.find.open, "the prompt should be showing");
+
+        type_into(&mut x, &fs, "needle");
+        assert_eq!(x.find.query, "needle");
+        assert_eq!(
+            x.doc.as_ref().unwrap().buffer.cursor(),
+            Cursor::new(1, 4),
+            "the cursor follows the search"
+        );
+    }
+
+    #[test]
+    fn while_finding_a_letter_never_reaches_the_editor() {
+        // `s` would otherwise be a character typed into the file, and Ctrl+S
+        // would save mid-search.
+        let fs = Fake::new(&[]);
+        let mut x = with_text("abc");
+        x.focus = Focus::Editor;
+        x.key(ctrl(KeyCode::Char('f')), 10, &fs);
+        type_into(&mut x, &fs, "s");
+
+        assert_eq!(x.doc.as_ref().unwrap().buffer.line(0), "abc");
+        assert!(!x.modified(), "the file must not have been edited");
+    }
+
+    #[test]
+    fn escape_from_the_prompt_puts_the_cursor_back() {
+        let fs = Fake::new(&[]);
+        let mut x = with_text("start\n\n\nfar away needle");
+        x.focus = Focus::Editor;
+        x.doc.as_mut().unwrap().buffer.goto(Cursor::new(0, 2));
+
+        x.key(ctrl(KeyCode::Char('f')), 10, &fs);
+        type_into(&mut x, &fs, "needle");
+        assert_eq!(x.doc.as_ref().unwrap().buffer.cursor().line, 3);
+
+        x.key(key(KeyCode::Esc), 10, &fs);
+        assert!(!x.find.open);
+        assert_eq!(
+            x.doc.as_ref().unwrap().buffer.cursor(),
+            Cursor::new(0, 2),
+            "abandoning a search should not have moved you"
+        );
+    }
+
+    #[test]
+    fn enter_keeps_the_hit_and_closes_the_prompt() {
+        let fs = Fake::new(&[]);
+        let mut x = with_text("a\nneedle");
+        x.focus = Focus::Editor;
+        x.key(ctrl(KeyCode::Char('f')), 10, &fs);
+        type_into(&mut x, &fs, "needle");
+        x.key(key(KeyCode::Enter), 10, &fs);
+
+        assert!(!x.find.open);
+        assert_eq!(x.doc.as_ref().unwrap().buffer.cursor(), Cursor::new(1, 0));
+        assert_eq!(x.doc.as_ref().unwrap().buffer.len(), 2, "no newline typed");
+    }
+
+    #[test]
+    fn f3_keeps_stepping_after_the_prompt_has_closed() {
+        let fs = Fake::new(&[]);
+        let mut x = with_text("x\nx\nx");
+        x.focus = Focus::Editor;
+        x.key(ctrl(KeyCode::Char('f')), 10, &fs);
+        type_into(&mut x, &fs, "x");
+        x.key(key(KeyCode::Enter), 10, &fs);
+
+        x.key(key(KeyCode::F(3)), 10, &fs);
+        assert_eq!(x.doc.as_ref().unwrap().buffer.cursor(), Cursor::new(1, 0));
+        x.key(KeyEvent::new(KeyCode::F(3), KeyModifiers::SHIFT), 10, &fs);
+        assert_eq!(
+            x.doc.as_ref().unwrap().buffer.cursor(),
+            Cursor::new(0, 0),
+            "Shift+F3 goes back"
+        );
+    }
+
+    #[test]
+    fn f3_with_nothing_searched_for_does_nothing() {
+        let fs = Fake::new(&[]);
+        let mut x = with_text("abc");
+        x.focus = Focus::Editor;
+        x.doc.as_mut().unwrap().buffer.goto(Cursor::new(0, 2));
+        x.key(key(KeyCode::F(3)), 10, &fs);
+        assert_eq!(x.doc.as_ref().unwrap().buffer.cursor(), Cursor::new(0, 2));
+    }
+
+    #[test]
+    fn find_reflects_an_edit_made_since_the_search() {
+        // Stepping to a position where the word used to be would be worse than
+        // finding nothing.
+        let fs = Fake::new(&[]);
+        let mut x = with_text("needle\nneedle");
+        x.focus = Focus::Editor;
+        x.key(ctrl(KeyCode::Char('f')), 10, &fs);
+        type_into(&mut x, &fs, "needle");
+        x.key(key(KeyCode::Enter), 10, &fs);
+
+        // Wipe the second line's word.
+        x.doc.as_mut().unwrap().buffer.goto(Cursor::new(1, 6));
+        for _ in 0..6 {
+            x.key(key(KeyCode::Backspace), 10, &fs);
+        }
+
+        x.key(key(KeyCode::F(3)), 10, &fs);
+        assert_eq!(x.find.hits.len(), 1, "only the surviving one");
+        assert_eq!(x.doc.as_ref().unwrap().buffer.cursor(), Cursor::new(0, 0));
+    }
+
+    #[test]
+    fn find_will_not_open_over_a_file_that_has_no_text() {
+        // A binary file shows a message, not a document; a prompt over it could
+        // never match anything.
+        let fs = Fake::new(&[]);
+        let mut x = Explorer::new(r"C:\p".into());
+        x.notice = Some("binary".into());
+        x.key(ctrl(KeyCode::Char('f')), 10, &fs);
+        assert!(!x.find.open);
+    }
+
+    #[test]
+    fn opening_another_file_forgets_the_previous_search() {
+        let fs = Fake::new(&[]);
+        let mut x = with_text("needle");
+        x.focus = Focus::Editor;
+        x.key(ctrl(KeyCode::Char('f')), 10, &fs);
+        type_into(&mut x, &fs, "needle");
+        assert_eq!(x.find.hits.len(), 1);
+
+        x.load(Path::new(r"C:\p\does-not-exist.txt"));
+        assert!(x.find.hits.is_empty(), "hits belong to the old file");
+        assert!(x.find.query.is_empty());
+        assert!(!x.find.open);
     }
 
     #[test]

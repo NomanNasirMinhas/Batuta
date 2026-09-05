@@ -14,6 +14,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table};
 
 use super::app::{App, DupeEntry, Kind, Mode, PendingDiscard, Sort, DUPES_MIN_SIZE};
+use super::explorer::find;
 use super::explorer::state::{Explorer, Focus};
 use super::layout::{self, Panes};
 use super::theme::theme;
@@ -125,13 +126,14 @@ pub fn draw(f: &mut Frame, app: &App) -> usize {
 /// Returns how many editor lines fit, which the event loop feeds back in the
 /// same way the result list's row count is.
 fn draw_explorer(f: &mut Frame, app: &App) -> usize {
-    let panes = layout::explorer(f.area(), true);
-    f.render_widget(Block::default().style(base_style()), f.area());
-
     let accent = mode_accent(Mode::Explore);
     let Some(x) = &app.explorer else {
+        // Nothing to lay out against; the frame still needs its background.
+        f.render_widget(Block::default().style(base_style()), f.area());
         return 0;
     };
+    let panes = layout::explorer(f.area(), true, x.find.open);
+    f.render_widget(Block::default().style(base_style()), f.area());
 
     let title = x
         .open_path()
@@ -143,6 +145,9 @@ fn draw_explorer(f: &mut Frame, app: &App) -> usize {
         draw_tree(f, area, x, accent);
     }
     let visible = draw_editor(f, panes.editor, x, accent);
+    if let Some(area) = panes.find {
+        draw_find_bar(f, area, x, accent);
+    }
     draw_path_bar(f, panes.path, x, accent, panes.compact);
     draw_explore_status(f, panes.status, app, x);
 
@@ -270,13 +275,12 @@ fn draw_editor(f: &mut Frame, area: Rect, x: &Explorer, accent: Color) -> usize 
         .take(visible)
         .map(|(n, text)| {
             let here = n == caret.line;
-            Line::from(vec![
-                Span::styled(
-                    format!("{:>width$} ", n + 1),
-                    Style::default().fg(if here { accent } else { theme().dim() }),
-                ),
-                Span::styled(text.clone(), Style::default().fg(theme().text())),
-            ])
+            let mut spans = vec![Span::styled(
+                format!("{:>width$} ", n + 1),
+                Style::default().fg(if here { accent } else { theme().dim() }),
+            )];
+            spans.extend(highlight_hits(text, n, x, accent));
+            Line::from(spans)
         })
         .collect();
 
@@ -292,6 +296,89 @@ fn draw_editor(f: &mut Frame, area: Rect, x: &Explorer, accent: Color) -> usize 
         }
     }
     visible
+}
+
+/// One line of the editor, with any search hits picked out.
+///
+/// The same treatment the result list gives matched terms: showing *why* a line
+/// is interesting beats making the reader find it again by eye. The hit the
+/// cursor is on is drawn differently from the rest, so stepping with `F3` is
+/// visible rather than inferred from the cursor alone.
+fn highlight_hits<'a>(text: &'a str, line: usize, x: &Explorer, accent: Color) -> Vec<Span<'a>> {
+    let plain = Style::default().fg(theme().text());
+    let hits = find::on_line(&x.find.hits, line);
+    if hits.is_empty() || x.find.query.is_empty() {
+        return vec![Span::styled(text.to_string(), plain)];
+    }
+
+    let current = x.find.cursor();
+    let len = x.find.query.chars().count();
+    let chars: Vec<char> = text.chars().collect();
+
+    let mut spans = Vec::new();
+    let mut at = 0usize;
+    for hit in hits {
+        // Guard rather than slice blindly: the buffer can have been edited
+        // since the hits were found, and `panic = "abort"` in release makes a
+        // stale index fatal rather than merely wrong.
+        let start = hit.col.min(chars.len());
+        let end = (hit.col + len).min(chars.len());
+        if start < at {
+            continue;
+        }
+        if start > at {
+            spans.push(Span::styled(
+                chars[at..start].iter().collect::<String>(),
+                plain,
+            ));
+        }
+        let style = if current == Some(*hit) {
+            Style::default().bg(accent).fg(theme().on_accent())
+        } else {
+            Style::default()
+                .fg(accent)
+                .add_modifier(Modifier::UNDERLINED)
+        };
+        spans.push(Span::styled(
+            chars[start..end].iter().collect::<String>(),
+            style,
+        ));
+        at = end;
+    }
+    if at < chars.len() {
+        spans.push(Span::styled(chars[at..].iter().collect::<String>(), plain));
+    }
+    spans
+}
+
+/// The find prompt: what is being searched for, and how it is going.
+fn draw_find_bar(f: &mut Frame, area: Rect, x: &Explorer, accent: Color) {
+    let tally = x.find.tally();
+    let line = Line::from(vec![
+        Span::styled(
+            " find ",
+            Style::default().bg(accent).fg(theme().on_accent()),
+        ),
+        Span::raw(" "),
+        Span::styled(x.find.query.clone(), Style::default().fg(theme().text())),
+        Span::raw("  "),
+        Span::styled(
+            tally,
+            Style::default().fg(if x.find.hits.is_empty() {
+                theme().warn()
+            } else {
+                dim()
+            }),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+
+    // The caret belongs in the prompt while it has the keyboard, not in the
+    // text being searched.
+    let col = 7 + x.find.caret as u16;
+    if col < area.width {
+        f.set_cursor_position((area.x + col, area.y));
+    }
 }
 
 fn draw_path_bar(f: &mut Frame, area: Rect, x: &Explorer, accent: Color, compact: bool) {
@@ -369,6 +456,21 @@ fn draw_explore_status(f: &mut Frame, area: Rect, app: &App, x: &Explorer) {
     // and redo appear only when there is something to undo or redo.
     let undo = x.doc.as_ref().is_some_and(|d| d.buffer.can_undo());
     let redo = x.doc.as_ref().is_some_and(|d| d.buffer.can_redo());
+    // The prompt has its own small vocabulary, and the editor's keys do not
+    // apply while it is showing.
+    if x.find.open {
+        let keys = "Enter keep  Esc cancel  \u{2191}\u{2193} between matches";
+        f.render_widget(Paragraph::new(Line::from(left)), area);
+        if area.width >= keys.chars().count() as u16 + 30 {
+            f.render_widget(
+                Paragraph::new(Span::styled(keys, Style::default().fg(dim())))
+                    .alignment(Alignment::Right),
+                area,
+            );
+        }
+        return;
+    }
+
     let mut full = String::from("Ctrl+S save");
     if undo {
         full.push_str("  Ctrl+Z undo");
@@ -376,19 +478,26 @@ fn draw_explore_status(f: &mut Frame, area: Rect, app: &App, x: &Explorer) {
     if redo {
         full.push_str("  Ctrl+Y redo");
     }
-    full.push_str("  Shift+Enter open  F5 refresh  Esc back");
-    let some = "Ctrl+S save  Esc back";
+    // Not "Esc back": Esc deliberately does nothing here, and a hint naming a
+    // key that is ignored is worse than no hint.
+    full.push_str("  Ctrl+F find  Shift+Enter open  F5 refresh  Ctrl+E back");
+    let some = "Ctrl+S save  Ctrl+F find  Ctrl+E back";
 
-    let keys = [full.as_str(), some, "Esc back"]
+    // Enough for "line 120 col 40  ·  9,999 lines  ·  CRLF  ·  unsaved".
+    // The hints give way before the state does: a key you can guess is worth
+    // less than being told the file has unsaved changes.
+    const STATE_MIN: u16 = 55;
+
+    let keys = [full.as_str(), some, "Ctrl+E back"]
         .into_iter()
-        .find(|k| area.width >= k.chars().count() as u16 + 30);
+        .find(|k| area.width >= k.chars().count() as u16 + STATE_MIN);
 
     let Some(keys) = keys else {
         f.render_widget(Paragraph::new(Line::from(left)), area);
         return;
     };
     let chunks = Layout::horizontal([
-        Constraint::Min(30),
+        Constraint::Min(STATE_MIN),
         Constraint::Length(keys.chars().count() as u16),
     ])
     .split(area);
@@ -1521,6 +1630,46 @@ mod tests {
             "an unsaved buffer has to say so"
         );
         assert!(visible > 0, "the editor must report how many lines fit");
+    }
+
+    #[test]
+    fn the_find_bar_shows_the_query_and_how_many_it_matched() {
+        let mut app = explorer_fixture();
+        {
+            let x = app.explorer.as_mut().unwrap();
+            let lines = x.doc.as_ref().unwrap().buffer.lines().to_vec();
+            x.find
+                .open(crate::tui::explorer::buffer::Cursor::new(0, 0), &lines);
+            for c in "path".chars() {
+                x.find.insert(c, &lines);
+            }
+        }
+        let (screen, _) = render(&app, 118, 22);
+
+        assert!(screen.contains("find"), "the prompt should name itself");
+        assert!(screen.contains("path"), "the query should be shown");
+        // Two occurrences of "path" in the fixture, so the tally is a count
+        // rather than a bare marker.
+        assert!(
+            screen.contains("/2"),
+            "the tally should say how many were found:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_search_that_matches_nothing_says_so() {
+        let mut app = explorer_fixture();
+        {
+            let x = app.explorer.as_mut().unwrap();
+            let lines = x.doc.as_ref().unwrap().buffer.lines().to_vec();
+            x.find
+                .open(crate::tui::explorer::buffer::Cursor::new(0, 0), &lines);
+            for c in "zzzz".chars() {
+                x.find.insert(c, &lines);
+            }
+        }
+        let (screen, _) = render(&app, 118, 22);
+        assert!(screen.contains("no matches"), "{screen}");
     }
 
     #[test]

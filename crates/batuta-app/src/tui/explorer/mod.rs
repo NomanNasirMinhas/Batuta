@@ -6,5 +6,6 @@
 
 pub mod buffer;
 pub mod file;
+pub mod find;
 pub mod state;
 pub mod tree;

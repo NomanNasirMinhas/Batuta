@@ -605,7 +605,9 @@ fn window_button(app: &mut App, col: u16, row: u16, width: u16, height: u16) {
     };
     let bar = match app.mode {
         Mode::Terminal => layout::terminal(area).title,
-        Mode::Explore => layout::explorer(area, true).title,
+        // The title bar is the top row whatever else is showing, so the find
+        // prompt makes no difference to where the buttons are.
+        Mode::Explore => layout::explorer(area, true, false).title,
         _ => return,
     };
 
