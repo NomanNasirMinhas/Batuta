@@ -198,15 +198,71 @@ mod imp {
         }
     }
 
-    /// Open the UI in its own console window.
+    /// Open the UI in a console of its own.
+    ///
+    /// `CreateProcessW` directly, rather than `std::process::Command`, for one
+    /// reason: this process has no console. `FreeConsole` above closed it, so
+    /// `GetStdHandle` now answers with nothing, and `Command` — which always
+    /// passes the three standard handles on to the child — asks
+    /// `DuplicateHandle` to copy them and gets `ERROR_INVALID_HANDLE` back.
+    /// Every press produced that and nothing else.
+    ///
+    /// Passing no handles is not something `Command` can express, and the two
+    /// obvious workarounds are both worse. Inheriting the handles is what just
+    /// failed. Redirecting to `NUL` would spawn successfully and then draw the
+    /// interface into the null device, which is a blank window rather than an
+    /// error — the harder failure to diagnose of the two.
+    ///
+    /// So: `bInheritHandles = FALSE` and a `STARTUPINFOW` with no
+    /// `STARTF_USESTDHANDLES`. `CREATE_NEW_CONSOLE` then gives the child a
+    /// fresh console and standard handles attached to it, which is what the
+    /// interface needs to draw on.
     fn launch(exe: &Path) -> io::Result<()> {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-        std::process::Command::new(exe)
-            .arg("ui")
-            .creation_flags(CREATE_NEW_CONSOLE)
-            .spawn()
-            .map(|_| ())
+        spawn_detached(exe, "ui")
+    }
+
+    /// Start `exe args` in its own console, inheriting nothing.
+    fn spawn_detached(exe: &Path, args: &str) -> io::Result<()> {
+        use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+        use windows_sys::Win32::System::Threading::{
+            CreateProcessW, CREATE_NEW_CONSOLE, PROCESS_INFORMATION, STARTUPINFOW,
+        };
+
+        // `CreateProcessW` may write to the command line it is given, so it
+        // cannot be a literal or a shared buffer.
+        let mut cmdline = wide(&format!("\"{}\" {args}", exe.display()));
+
+        // Zeroed, so `dwFlags` carries no STARTF_USESTDHANDLES and the handle
+        // fields are ignored. That is the whole point of doing this by hand.
+        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+        let started = unsafe {
+            CreateProcessW(
+                ptr::null(),
+                cmdline.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                FALSE,
+                CREATE_NEW_CONSOLE,
+                ptr::null(),
+                ptr::null(),
+                &si,
+                &mut pi,
+            )
+        };
+        if started == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // The child is not waited on; these two handles are all this process
+        // holds of it, and leaking one per keypress would be a slow leak in a
+        // program that runs for the whole session.
+        unsafe {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+        Ok(())
     }
 
     fn open_run(access: u32, create: bool) -> io::Result<HKEY> {
@@ -298,6 +354,103 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Start `exe args` the way Explorer starts the helper: its own
+        /// console, and **no inherited handles**, then wait for it.
+        ///
+        /// The second half is what makes this faithful, and it is easy to get
+        /// wrong. Under `cargo test` the harness hands a child pipe handles,
+        /// and `FreeConsole` does not invalidate a pipe — so a probe started
+        /// the ordinary way succeeds whether the code under test is fixed or
+        /// broken, and proves nothing. Only a child whose standard handles
+        /// really belong to the console it just closed reproduces the failure.
+        fn spawn_probe_and_wait(exe: &Path, args: &str, env: &str) -> u32 {
+            use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+            use windows_sys::Win32::System::Threading::{
+                CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_NEW_CONSOLE,
+                CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
+            };
+
+            let mut cmdline = wide(&format!("\"{}\" {args}", exe.display()));
+
+            // The child needs the marker variable, and a block passed here
+            // replaces the environment wholesale, so the parent's is copied.
+            let mut block: Vec<u16> = Vec::new();
+            for (k, v) in std::env::vars() {
+                block.extend(wide(&format!("{k}={v}")));
+            }
+            block.extend(wide(env));
+            block.push(0);
+
+            let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+            si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+            let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+            let started = unsafe {
+                CreateProcessW(
+                    ptr::null(),
+                    cmdline.as_mut_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    FALSE,
+                    CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT,
+                    block.as_ptr() as *const std::ffi::c_void,
+                    ptr::null(),
+                    &si,
+                    &mut pi,
+                )
+            };
+            assert_ne!(started, 0, "could not start the probe child");
+
+            let mut code = 1u32;
+            unsafe {
+                WaitForSingleObject(pi.hProcess, INFINITE);
+                GetExitCodeProcess(pi.hProcess, &mut code);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+            code
+        }
+
+        /// The bug this exists for: the helper detaches from its console at
+        /// startup, and every launch afterwards failed with
+        /// `ERROR_INVALID_HANDLE`, because the spawn was handing the child the
+        /// standard handles that the detach had just closed. The hotkey
+        /// registered, the hotkey fired, and nothing opened.
+        #[test]
+        fn the_ui_can_be_launched_after_detaching_from_the_console() {
+            use windows_sys::Win32::System::Console::FreeConsole;
+
+            let out = std::env::temp_dir().join("batuta-detached-spawn-probe.txt");
+
+            // The child half: detach exactly as `run` does, then launch
+            // something harmless exactly as a keypress would.
+            if std::env::var_os("BATUTA_DETACHED_SPAWN_PROBE").is_some() {
+                let freed = unsafe { FreeConsole() };
+                let answer = match spawn_detached(Path::new("cmd.exe"), "/c exit 0") {
+                    Ok(()) => format!("ok (FreeConsole returned {freed})"),
+                    Err(e) => format!("{e} (FreeConsole returned {freed})"),
+                };
+                let _ = std::fs::write(&out, answer);
+                return;
+            }
+
+            let _ = std::fs::remove_file(&out);
+            let code = spawn_probe_and_wait(
+                &std::env::current_exe().unwrap(),
+                "the_ui_can_be_launched_after_detaching_from_the_console --nocapture",
+                "BATUTA_DETACHED_SPAWN_PROBE=1",
+            );
+            assert_eq!(code, 0, "the detached child failed to run");
+
+            let answer = std::fs::read_to_string(&out).expect("the child reported nothing");
+            let _ = std::fs::remove_file(&out);
+            assert!(
+                answer.starts_with("ok"),
+                "launching after FreeConsole failed, which is exactly what left the \
+                 hotkey firing into nothing: {answer}"
+            );
+        }
 
         #[test]
         fn the_autostart_command_quotes_the_executable() {

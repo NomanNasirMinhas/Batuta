@@ -585,6 +585,27 @@ Known limitations:
   built before the fix.
 - The TUI has no treemap; a terminal cannot really draw one.
 
+### Why the helper launches the UI by hand
+
+`CreateProcessW` directly, not `std::process::Command`. The helper detaches
+from the console Explorer gives it — otherwise a blank window sits on the
+desktop for the whole session — and `Command` always passes the three standard
+handles to the child. After the detach those handles are closed, so
+`DuplicateHandle` refuses them and every keypress produced
+`ERROR_INVALID_HANDLE` and no window.
+
+Redirecting them to `NUL` would spawn successfully and then draw the interface
+into the null device: a blank window instead of an error, which is the harder
+failure to find. Passing no handles at all is not something `Command` can
+express, so the call is made by hand with `bInheritHandles = FALSE` and a
+`STARTUPINFOW` carrying no `STARTF_USESTDHANDLES`. `CREATE_NEW_CONSOLE` then
+gives the child a console of its own and standard handles attached to it.
+
+The regression test for this has to run in a child process that genuinely owns
+a console. Under `cargo test` the harness hands a child *pipe* handles, and
+detaching does not invalidate a pipe — so the obvious version of the test
+passes against the broken code and proves nothing.
+
 ## Setup internals
 
 A few decisions in the wizard are worth knowing about.
